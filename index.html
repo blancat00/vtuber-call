@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>アバター通話 — Face Tracking VTuber</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+  body { background: linear-gradient(180deg, #bcd7ff, #eaf3ff); }
+  canvas.stage { position: fixed; inset: 0; display: block; }
+  #flat { position: fixed; inset: 0; display: none; touch-action: none; }
+
+  #cam {
+    position: fixed; right: 14px; bottom: 14px; width: 184px; z-index: 5;
+    border-radius: 10px; transform: scaleX(-1); opacity: .92;
+    box-shadow: 0 4px 18px rgba(0,0,0,.45); background: #111;
+  }
+
+  #panel {
+    position: fixed; left: 14px; top: 14px; z-index: 10; width: 292px;
+    background: rgba(18, 20, 30, .88); color: #ecedf2;
+    padding: 14px 16px 12px; border-radius: 14px;
+    backdrop-filter: blur(8px); font-size: 13px; line-height: 1.7;
+    box-shadow: 0 6px 24px rgba(0,0,0,.35);
+  }
+  #panel h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .03em; }
+  #panel h1 small { font-size: 10px; color: #8fa3c8; font-weight: normal; margin-left: 6px; }
+  #status { font-size: 12px; color: #9fe6b0; min-height: 1.5em; margin-bottom: 8px; }
+  #status.err { color: #ff9d9d; }
+  #status.warn { color: #ffd98a; }
+
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  button {
+    flex: 1; padding: 7px 10px; border: 0; border-radius: 8px; cursor: pointer;
+    background: #3b6cf0; color: #fff; font-size: 13px; font-family: inherit;
+  }
+  button:hover { background: #4f7cff; }
+  button.sub { background: #3a3f52; }
+  button.sub:hover { background: #4a5066; }
+
+  label.line { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  select { width: 100%; background: #2a2e3e; color: #eee; border: 1px solid #444a60; border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+  input[type=color] { width: 30px; height: 24px; border: 0; padding: 0; background: none; cursor: pointer; }
+
+  .swatches { display: flex; gap: 6px; align-items: center; }
+  .sw { width: 22px; height: 22px; border-radius: 6px; border: 2px solid rgba(255,255,255,.35); cursor: pointer; padding: 0; flex: none; }
+
+  .imgOnly { display: none; }
+  body[data-mode="image"] .imgOnly { display: flex; }
+
+  details { margin-top: 8px; font-size: 12px; }
+  details summary { cursor: pointer; color: #a9c4ff; }
+  details ol { margin: 6px 0 4px; padding-left: 18px; }
+  .hint { margin-top: 8px; font-size: 11px; color: #8b90a5; }
+
+  #dropOverlay {
+    position: fixed; inset: 0; z-index: 50; display: none;
+    background: rgba(40, 90, 220, .25); border: 4px dashed #6f9aff;
+    align-items: center; justify-content: center;
+    color: #fff; font-size: 22px; font-weight: bold; text-shadow: 0 2px 8px rgba(0,0,0,.5);
+  }
+  #dropOverlay.on { display: flex; }
+
+  /* 画像アバターの設定エディタ */
+  #editor {
+    position: fixed; inset: 0; z-index: 60; display: none;
+    flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    background: rgba(8, 10, 16, .92);
+  }
+  #editor.on { display: flex; }
+  #edMsg { color: #fff; font-size: 16px; font-weight: bold; text-shadow: 0 1px 4px #000; }
+  #edCanvas { max-width: 92vw; max-height: 72vh; background: #222; border-radius: 8px; cursor: crosshair; touch-action: none; }
+  #edBtns { display: flex; gap: 10px; }
+  #edBtns button { min-width: 130px; padding: 9px 14px; }
+  #edBtns button:disabled { opacity: .4; cursor: default; }
+
+  /* スマホ対応 */
+  @media (max-width: 480px) {
+    #panel { width: calc(100vw - 28px); max-height: 62vh; overflow-y: auto; box-sizing: border-box; }
+    #cam { width: 104px; }
+    #edBtns button { min-width: 90px; }
+  }
+</style>
+</head>
+<body data-mode="none">
+
+<canvas id="flat"></canvas>
+<video id="cam" autoplay playsinline muted></video>
+
+<div id="panel">
+  <h1>アバター通話<small>face tracking vtuber</small></h1>
+  <div id="status">初期化中…</div>
+
+  <div class="row">
+    <button id="btnCat">ネコアバター</button>
+    <button id="btnFile" class="sub">ファイルを開く</button>
+  </div>
+  <div class="row">
+    <button id="btnSample" class="sub">3Dサンプル（VRM）</button>
+  </div>
+  <input type="file" id="fileInput" accept=".vrm,image/png,image/jpeg,image/webp" hidden>
+
+  <div class="row imgOnly">
+    <button id="btnRecalib" class="sub">範囲・目・口を再設定</button>
+  </div>
+  <label class="line imgOnly"><input type="checkbox" id="chkBgRemove" checked> 背景を自動で透過する</label>
+
+  <label class="line">カメラ
+    <select id="camSel"><option>（検出中…）</option></select>
+  </label>
+
+  <label class="line">背景
+    <span class="swatches">
+      <button class="sw" data-bg="linear-gradient(180deg,#bcd7ff,#eaf3ff)" style="background:linear-gradient(180deg,#bcd7ff,#eaf3ff)" title="そら"></button>
+      <button class="sw" data-bg="#00b140" style="background:#00b140" title="グリーンバック"></button>
+      <button class="sw" data-bg="#0047bb" style="background:#0047bb" title="ブルーバック"></button>
+      <button class="sw" data-bg="#ffffff" style="background:#fff" title="白"></button>
+      <button class="sw" data-bg="#1a1a1a" style="background:#1a1a1a" title="黒"></button>
+      <input type="color" id="bgPick" value="#bcd7ff" title="好きな色">
+    </span>
+  </label>
+
+  <label class="line"><input type="checkbox" id="chkMirror" checked> ミラー（鏡のように動く）</label>
+  <label class="line"><input type="checkbox" id="chkFlipX"> 上下の動きを反転</label>
+  <label class="line"><input type="checkbox" id="chkPip" checked> 自分のカメラ映像を表示</label>
+
+  <details>
+    <summary>LINEで使う手順（PC）</summary>
+    <ol>
+      <li>この画面を表示したままにする（最小化はNG）</li>
+      <li>OBSで「ウィンドウキャプチャ」→このブラウザを選択</li>
+      <li>OBSの「仮想カメラ開始」を押す</li>
+      <li>PC版LINE：設定→通話→カメラを「OBS Virtual Camera」に</li>
+      <li>ビデオ通話を開始！</li>
+    </ol>
+  </details>
+  <details>
+    <summary>LINEで使う手順（スマホ1台）</summary>
+    <ol>
+      <li>LINEで<b>ビデオ通話を開始</b>し、自分のカメラを<b>OFF</b>にする</li>
+      <li>通話メニューから<b>「画面シェア」を開始</b></li>
+      <li>ホームに戻ってブラウザでこのページを開く</li>
+      <li>カメラ許可→アバターが動く→相手には画面シェアでアバターが見える</li>
+      <li>声はそのままLINEのマイクで届くで</li>
+    </ol>
+  </details>
+
+  <div class="hint">Hキー：パネル表示切替　／　VRMでも画像（PNG/JPG）でもドラッグ&ドロップで読み込めるで。画像はホイールで拡大縮小・ドラッグで位置調整や。</div>
+</div>
+
+<div id="dropOverlay">ここにドロップ！（.vrm / 画像）</div>
+
+<div id="editor">
+  <div id="edMsg"></div>
+  <canvas id="edCanvas"></canvas>
+  <div id="edBtns">
+    <button id="edOk">OK</button>
+    <button id="edRedo" class="sub">選び直す</button>
+    <button id="edCancel" class="sub">キャンセル</button>
+  </div>
+</div>
+
+<!-- Kalidokit (UMD) -->
+<script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.5/dist/kalidokit.umd.js"></script>
+<!-- 付属ネコアバター素材 -->
+<script src="cat_assets.js"></script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3/lib/three-vrm.module.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { FaceLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs';
+
+const Kalidokit = window.Kalidokit;
+
+const SAMPLE_VRM_URL = 'https://cdn.jsdelivr.net/gh/pixiv/three-vrm@dev/packages/three-vrm/examples/models/VRM1_Constraint_Twist_Sample.vrm';
+const MP_WASM_URL    = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
+const MP_MODEL_URL   = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const video = $('cam');
+const statusEl = $('status');
+const panel = $('panel');
+const params = new URLSearchParams(location.search);
+const clamp = THREE.MathUtils.clamp;
+const lerp = THREE.MathUtils.lerp;
+
+function setStatus(text, type = '') {
+  statusEl.textContent = text;
+  statusEl.className = type;
+}
+
+// ---------- 設定の保存 ----------
+const settings = JSON.parse(localStorage.getItem('vtuber-call-settings') || '{}');
+function saveSettings() {
+  localStorage.setItem('vtuber-call-settings', JSON.stringify(settings));
+}
+
+// ---------- モード（vrm / image） ----------
+let mode = 'none';
+function setMode(m) {
+  mode = m;
+  document.body.dataset.mode = m;
+  renderer.domElement.style.display = m === 'vrm' ? '' : 'none';
+  $('flat').style.display = m === 'image' ? 'block' : 'none';
+}
+
+// ---------- three.js ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.domElement.className = 'stage';
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera3 = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.1, 30);
+camera3.position.set(0, 1.4, 1.35);
+
+const controls = new OrbitControls(camera3, renderer.domElement);
+controls.enableDamping = true;
+controls.minDistance = 0.3;
+controls.maxDistance = 4;
+controls.target.set(0, 1.35, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+dirLight.position.set(0.4, 1.6, 2.0);
+scene.add(dirLight);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera3.aspect = innerWidth / innerHeight;
+  camera3.updateProjectionMatrix();
+});
+
+// ---------- 背景 ----------
+function setBackground(bg) {
+  document.body.style.background = bg;
+  settings.bg = bg;
+  saveSettings();
+}
+document.querySelectorAll('.sw').forEach((b) => b.addEventListener('click', () => setBackground(b.dataset.bg)));
+$('bgPick').addEventListener('input', (e) => setBackground(e.target.value));
+if (params.get('bg')) setBackground('#' + params.get('bg').replace('#', ''));
+else if (settings.bg) setBackground(settings.bg);
+
+// ---------- アバターの保存（次回起動時に自動復元） ----------
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('vtuber-call', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('vrm');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbPut(record) {
+  try {
+    const db = await openDB();
+    db.transaction('vrm', 'readwrite').objectStore('vrm').put(record, 'last');
+  } catch (e) { console.warn('アバター保存失敗', e); }
+}
+async function idbGet() {
+  try {
+    const db = await openDB();
+    return await new Promise((res) => {
+      const rq = db.transaction('vrm', 'readonly').objectStore('vrm').get('last');
+      rq.onsuccess = () => res(rq.result || null);
+      rq.onerror = () => res(null);
+    });
+  } catch { return null; }
+}
+
+// ---------- VRM読み込み ----------
+const loader = new GLTFLoader();
+loader.crossOrigin = 'anonymous';
+loader.register((parser) => new VRMLoaderPlugin(parser));
+
+let currentVrm = null;
+
+async function loadVRMFromURL(url) {
+  setStatus('アバター読み込み中…');
+  const gltf = await loader.loadAsync(url);
+  const vrm = gltf.userData.vrm;
+  if (!vrm) throw new Error('VRMデータが見つからへん');
+
+  VRMUtils.removeUnnecessaryVertices(gltf.scene);
+  if (VRMUtils.combineSkeletons) VRMUtils.combineSkeletons(gltf.scene);
+  VRMUtils.rotateVRM0(vrm); // VRM0.x（VRoidの既定）を正面向きに
+
+  if (currentVrm) {
+    scene.remove(currentVrm.scene);
+    VRMUtils.deepDispose(currentVrm.scene);
+  }
+  currentVrm = vrm;
+  vrm.scene.traverse((o) => { o.frustumCulled = false; });
+  scene.add(vrm.scene);
+
+  // 腕を下ろす（Tポーズのままやと肩が画面に刺さるからな）
+  const lArm = vrm.humanoid.getNormalizedBoneNode('leftUpperArm');
+  const rArm = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
+  if (lArm) lArm.rotation.z = -1.2;
+  if (rArm) rArm.rotation.z = 1.2;
+
+  frameBust(vrm);
+  setMode('vrm');
+  setStatus('アバター読み込み完了！');
+}
+
+async function loadVRMFromBuffer(buf) {
+  const url = URL.createObjectURL(new Blob([buf]));
+  try { await loadVRMFromURL(url); } finally { URL.revokeObjectURL(url); }
+}
+
+// 胸から上のバストアップ構図にカメラを合わせる
+function frameBust(vrm) {
+  scene.updateMatrixWorld(true);
+  const headBone = vrm.humanoid.getRawBoneNode('head');
+  const p = new THREE.Vector3(0, 1.4, 0);
+  if (headBone) headBone.getWorldPosition(p);
+  const y = p.y - 0.11; // 髪を含めた頭のてっぺんが収まる高さ
+  camera3.position.set(0, y, 1.35);
+  controls.target.set(0, y, 0);
+  controls.update();
+}
+
+// ---------- 画像アバター（PNGtuber方式） ----------
+const flatCanvas = $('flat');
+const flatCtx = flatCanvas.getContext('2d');
+
+const flatAvatar = {
+  raw: null,     // 切り抜き直後（透過処理前）
+  sprite: null,  // 表示用（透過処理後）
+  calib: null,   // {le,re,m} 画像内の正規化座標
+  eyeR: 10, mouthR: 12,
+  lidColorL: '#e8e4de', lidColorR: '#e8e4de',
+};
+let currentRecord = null;
+
+const flatState  = { tilt: 0, sx: 0, sy: 0, blinkL: 0, blinkR: 0, mouth: 0 };
+const flatTarget = { tilt: 0, sx: 0, sy: 0, blinkL: 0, blinkR: 0, mouth: 0 };
+
+// 背景の自動透過：フチの色を基準に、つながってる部分だけ消す
+function removeBackground(canvas, tol = 30) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+
+  // フチの色の中央値 = 背景色とみなす
+  const samples = [];
+  for (let x = 0; x < w; x += 3) samples.push((0 * w + x) * 4, ((h - 1) * w + x) * 4);
+  for (let y = 0; y < h; y += 3) samples.push((y * w + 0) * 4, (y * w + (w - 1)) * 4);
+  const ch = (off) => samples.map((i) => d[i + off]).sort((a, b) => a - b)[samples.length >> 1];
+  const bg = [ch(0), ch(1), ch(2)];
+
+  const dist = (i) => Math.hypot(d[i] - bg[0], d[i + 1] - bg[1], d[i + 2] - bg[2]);
+  const visited = new Uint8Array(w * h);
+  const stack = [];
+  for (let x = 0; x < w; x++) { stack.push(x, (h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { stack.push(y * w, y * w + w - 1); }
+
+  while (stack.length) {
+    const p = stack.pop();
+    if (visited[p]) continue;
+    visited[p] = 1;
+    if (dist(p * 4) > tol) continue;
+    d[p * 4 + 3] = 0;
+    const x = p % w, y = (p / w) | 0;
+    if (x > 0) stack.push(p - 1);
+    if (x < w - 1) stack.push(p + 1);
+    if (y > 0) stack.push(p - w);
+    if (y < h - 1) stack.push(p + w);
+  }
+
+  // フチを1pxぼかして馴染ませる
+  const a = (x, y) => d[(y * w + x) * 4 + 3];
+  const soft = [];
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      if (a(x, y) > 0 && (a(x - 1, y) === 0 || a(x + 1, y) === 0 || a(x, y - 1) === 0 || a(x, y + 1) === 0)) {
+        soft.push((y * w + x) * 4 + 3);
+      }
+    }
+  }
+  soft.forEach((i) => { d[i] = 140; });
+  ctx.putImageData(img, 0, 0);
+}
+
+function rebuildSprite(bgRemove) {
+  const raw = flatAvatar.raw;
+  const c = document.createElement('canvas');
+  c.width = raw.width; c.height = raw.height;
+  c.getContext('2d').drawImage(raw, 0, 0);
+  if (bgRemove) removeBackground(c);
+  flatAvatar.sprite = c;
+}
+
+// まぶたの色：目の周りの毛色をサンプリング
+function computeFaceMetrics() {
+  const { sprite, calib } = flatAvatar;
+  if (!sprite || !calib) return;
+  const w = sprite.width, h = sprite.height;
+  const le = { x: calib.le.x * w, y: calib.le.y * h };
+  const re = { x: calib.re.x * w, y: calib.re.y * h };
+  const m  = { x: calib.m.x * w,  y: calib.m.y * h };
+  const d = Math.max(Math.hypot(re.x - le.x, re.y - le.y), 8);
+  flatAvatar.eyeR = d * 0.30;
+  flatAvatar.mouthR = d * 0.36;
+  flatAvatar.px = { le, re, m };
+
+  const ctx = sprite.getContext('2d');
+  const sample = (p, r) => {
+    const x0 = Math.max(0, Math.round(p.x - r * 1.9));
+    const y0 = Math.max(0, Math.round(p.y - r * 1.9));
+    const size = Math.min(Math.round(r * 3.8), w - x0, h - y0);
+    if (size < 2) return '#e8e4de';
+    const data = ctx.getImageData(x0, y0, size, size).data;
+    let sr = 0, sg = 0, sb = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const px = x0 + ((i / 4) % size), py = y0 + (((i / 4) / size) | 0);
+      const dd = Math.hypot(px - p.x, py - p.y);
+      if (data[i + 3] > 200 && dd > r * 1.15 && dd < r * 1.9) { sr += data[i]; sg += data[i + 1]; sb += data[i + 2]; n++; }
+    }
+    if (!n) return '#e8e4de';
+    return `rgb(${(sr / n) | 0},${(sg / n) | 0},${(sb / n) | 0})`;
+  };
+  flatAvatar.lidColorL = sample(le, flatAvatar.eyeR);
+  flatAvatar.lidColorR = sample(re, flatAvatar.eyeR);
+}
+
+async function activateImage(record, { save = true } = {}) {
+  const bmp = await createImageBitmap(new Blob([record.buf], { type: record.mime || 'image/png' }));
+  const crop = record.crop || { x: 0, y: 0, w: bmp.width, h: bmp.height };
+  const raw = document.createElement('canvas');
+  raw.width = crop.w; raw.height = crop.h;
+  raw.getContext('2d').drawImage(bmp, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+  flatAvatar.raw = raw;
+  flatAvatar.calib = record.calib || { le: { x: 0.4, y: 0.35 }, re: { x: 0.6, y: 0.35 }, m: { x: 0.5, y: 0.55 } };
+  rebuildSprite(record.bgRemove !== false);
+  computeFaceMetrics();
+  $('chkBgRemove').checked = record.bgRemove !== false;
+  currentRecord = record;
+  setMode('image');
+  if (save) idbPut(record);
+  setStatus('画像アバター設定完了！');
+}
+
+$('chkBgRemove').addEventListener('change', (e) => {
+  if (!currentRecord || mode !== 'image') return;
+  currentRecord.bgRemove = e.target.checked;
+  rebuildSprite(e.target.checked);
+  computeFaceMetrics();
+  idbPut(currentRecord);
+});
+
+// ---------- 画像エディタ（範囲選択 → 目・口の指定） ----------
+const editor = $('editor');
+const edCanvas = $('edCanvas');
+const edCtx = edCanvas.getContext('2d');
+const edMsg = $('edMsg');
+
+function runEditor(bitmap, prevCrop = null) {
+  return new Promise((resolve) => {
+    let phase = 'crop'; // 'crop' → 'calib'
+    let rect = prevCrop ? { ...prevCrop } : null;
+    let dragStart = null;
+    let pts = []; // [左目, 右目, 口]
+    const PT_LABELS = ['左目', '右目', '口'];
+
+    const cropW = () => rect ? rect.w : bitmap.width;
+
+    function setupCanvas() {
+      if (phase === 'crop') {
+        edCanvas.width = bitmap.width; edCanvas.height = bitmap.height;
+        edMsg.textContent = 'アバターに使う範囲をドラッグで囲んでな（全体使うならそのままOK）';
+        $('edOk').textContent = rect ? 'この範囲でOK' : '全体を使う';
+      } else {
+        const c = rect || { x: 0, y: 0, w: bitmap.width, h: bitmap.height };
+        edCanvas.width = c.w; edCanvas.height = c.h;
+        edMsg.textContent = `「${PT_LABELS[pts.length] || '完了'}」の位置をクリックしてな（${pts.length}/3）`;
+        $('edOk').textContent = '完了';
+      }
+      draw();
+    }
+
+    function draw() {
+      edCtx.setTransform(1, 0, 0, 1, 0, 0);
+      if (phase === 'crop') {
+        edCtx.drawImage(bitmap, 0, 0);
+        if (rect) {
+          edCtx.fillStyle = 'rgba(0,0,0,0.55)';
+          edCtx.fillRect(0, 0, edCanvas.width, rect.y);
+          edCtx.fillRect(0, rect.y + rect.h, edCanvas.width, edCanvas.height - rect.y - rect.h);
+          edCtx.fillRect(0, rect.y, rect.x, rect.h);
+          edCtx.fillRect(rect.x + rect.w, rect.y, edCanvas.width - rect.x - rect.w, rect.h);
+          edCtx.strokeStyle = '#6f9aff';
+          edCtx.lineWidth = Math.max(2, bitmap.width / 400);
+          edCtx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+        }
+      } else {
+        const c = rect || { x: 0, y: 0, w: bitmap.width, h: bitmap.height };
+        edCtx.drawImage(bitmap, c.x, c.y, c.w, c.h, 0, 0, c.w, c.h);
+        const r = Math.max(5, c.w / 60);
+        pts.forEach((p, i) => {
+          edCtx.strokeStyle = '#ff5d8f';
+          edCtx.lineWidth = Math.max(2, c.w / 300);
+          edCtx.beginPath(); edCtx.arc(p.x, p.y, r, 0, Math.PI * 2); edCtx.stroke();
+          edCtx.beginPath();
+          edCtx.moveTo(p.x - r * 1.5, p.y); edCtx.lineTo(p.x + r * 1.5, p.y);
+          edCtx.moveTo(p.x, p.y - r * 1.5); edCtx.lineTo(p.x, p.y + r * 1.5);
+          edCtx.stroke();
+          edCtx.fillStyle = '#ff5d8f';
+          edCtx.font = `bold ${r * 1.6}px sans-serif`;
+          edCtx.fillText(PT_LABELS[i], p.x + r * 1.7, p.y - r * 0.5);
+        });
+      }
+      $('edOk').disabled = phase === 'calib' && pts.length < 3;
+      if (phase === 'calib') edMsg.textContent = pts.length < 3
+        ? `「${PT_LABELS[pts.length]}」の位置をクリックしてな（${pts.length}/3）`
+        : 'ええ感じ！「完了」を押してな';
+    }
+
+    const toImg = (e) => {
+      const r = edCanvas.getBoundingClientRect();
+      return {
+        x: clamp((e.clientX - r.left) * edCanvas.width / r.width, 0, edCanvas.width),
+        y: clamp((e.clientY - r.top) * edCanvas.height / r.height, 0, edCanvas.height),
+      };
+    };
+
+    function onDown(e) {
+      if (phase !== 'crop') return;
+      dragStart = toImg(e);
+      edCanvas.setPointerCapture(e.pointerId);
+    }
+    function onMove(e) {
+      if (phase !== 'crop' || !dragStart) return;
+      const p = toImg(e);
+      rect = {
+        x: Math.min(dragStart.x, p.x), y: Math.min(dragStart.y, p.y),
+        w: Math.abs(p.x - dragStart.x), h: Math.abs(p.y - dragStart.y),
+      };
+      $('edOk').textContent = 'この範囲でOK';
+      draw();
+    }
+    function onUp(e) {
+      if (phase === 'crop') {
+        if (rect && (rect.w < 12 || rect.h < 12)) { rect = null; $('edOk').textContent = '全体を使う'; }
+        dragStart = null;
+        draw();
+      } else {
+        if (pts.length >= 3) pts = [];
+        pts.push(toImg(e));
+        draw();
+      }
+    }
+    function onOk() {
+      if (phase === 'crop') {
+        if (rect) rect = { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h) };
+        phase = 'calib';
+        pts = [];
+        setupCanvas();
+      } else {
+        cleanup();
+        const c = rect || { x: 0, y: 0, w: bitmap.width, h: bitmap.height };
+        resolve({
+          crop: rect,
+          calib: {
+            le: { x: pts[0].x / c.w, y: pts[0].y / c.h },
+            re: { x: pts[1].x / c.w, y: pts[1].y / c.h },
+            m:  { x: pts[2].x / c.w, y: pts[2].y / c.h },
+          },
+        });
+      }
+    }
+    function onRedo() {
+      if (phase === 'crop') { rect = null; } else { pts = []; }
+      setupCanvas();
+    }
+    function onCancel() { cleanup(); resolve(null); }
+
+    function cleanup() {
+      editor.classList.remove('on');
+      edCanvas.removeEventListener('pointerdown', onDown);
+      edCanvas.removeEventListener('pointermove', onMove);
+      edCanvas.removeEventListener('pointerup', onUp);
+      $('edOk').removeEventListener('click', onOk);
+      $('edRedo').removeEventListener('click', onRedo);
+      $('edCancel').removeEventListener('click', onCancel);
+    }
+
+    edCanvas.addEventListener('pointerdown', onDown);
+    edCanvas.addEventListener('pointermove', onMove);
+    edCanvas.addEventListener('pointerup', onUp);
+    $('edOk').addEventListener('click', onOk);
+    $('edRedo').addEventListener('click', onRedo);
+    $('edCancel').addEventListener('click', onCancel);
+
+    editor.classList.add('on');
+    setupCanvas();
+  });
+}
+
+async function loadImageFile(f) {
+  try {
+    const buf = await f.arrayBuffer();
+    const bmp = await createImageBitmap(new Blob([buf], { type: f.type }));
+    const r = await runEditor(bmp);
+    if (!r) { setStatus('読み込みをやめたで'); return; }
+    await activateImage({
+      kind: 'image', buf, mime: f.type,
+      crop: r.crop, calib: r.calib,
+      bgRemove: $('chkBgRemove').checked,
+    });
+  } catch (err) {
+    console.error(err);
+    setStatus('画像の読み込みに失敗したわ…', 'err');
+  }
+}
+
+$('btnRecalib').addEventListener('click', async () => {
+  if (!currentRecord || currentRecord.kind !== 'image') return;
+  const bmp = await createImageBitmap(new Blob([currentRecord.buf], { type: currentRecord.mime || 'image/png' }));
+  const r = await runEditor(bmp, currentRecord.crop);
+  if (!r) return;
+  currentRecord.crop = r.crop;
+  currentRecord.calib = r.calib;
+  await activateImage(currentRecord);
+});
+
+// 画像アバターの描画
+function renderFlat() {
+  const cv = flatCanvas;
+  const dpr = Math.min(devicePixelRatio, 2);
+  const W = innerWidth, H = innerHeight;
+  if (cv.width !== (W * dpr | 0) || cv.height !== (H * dpr | 0)) {
+    cv.width = W * dpr | 0; cv.height = H * dpr | 0;
+  }
+  const ctx = flatCtx;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const s = flatAvatar.sprite;
+  if (!s) return;
+
+  // なめらかに追従
+  for (const k in flatState) flatState[k] = lerp(flatState[k], flatTarget[k], 0.28);
+
+  const view = settings.flatView || { zoom: 1, ox: 0, oy: 0 };
+  const breath = 1 + 0.006 * Math.sin(clock.elapsedTime * 2 * Math.PI / 4.2);
+  const scale = (H * 0.86 / s.height) * view.zoom * breath;
+
+  ctx.save();
+  ctx.translate(
+    W / 2 + view.ox + flatState.sx * s.width * scale,
+    H * 0.56 + view.oy + flatState.sy * s.height * scale
+  );
+  ctx.rotate(flatState.tilt);
+  ctx.scale(scale, scale);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(s, -s.width / 2, -s.height / 2);
+
+  // まぶた・口のオーバーレイ（画像座標系で描く）
+  if (flatAvatar.px) {
+    const { le, re, m } = flatAvatar.px;
+    const ox = -s.width / 2, oy = -s.height / 2;
+    drawLid(ctx, le.x + ox, le.y + oy, flatAvatar.eyeR, flatState.blinkL, flatAvatar.lidColorL);
+    drawLid(ctx, re.x + ox, re.y + oy, flatAvatar.eyeR, flatState.blinkR, flatAvatar.lidColorR);
+    drawMouth(ctx, m.x + ox, m.y + oy, flatAvatar.mouthR, flatState.mouth);
+  }
+  ctx.restore();
+}
+
+function drawLid(ctx, x, y, r, closed, color) {
+  if (closed < 0.08) return;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.ellipse(x, y, r * 1.25, Math.max(r * closed * 1.1, 0.5), 0, 0, Math.PI * 2);
+  ctx.fill();
+  if (closed > 0.75) { // 閉じ目のかわいい線
+    ctx.strokeStyle = 'rgba(70,55,50,0.6)';
+    ctx.lineWidth = Math.max(1, r * 0.14);
+    ctx.beginPath();
+    ctx.arc(x, y - r * 0.35, r * 0.85, 0.2 * Math.PI, 0.8 * Math.PI);
+    ctx.stroke();
+  }
+}
+
+function drawMouth(ctx, x, y, r, open) {
+  if (open < 0.07) return;
+  ctx.fillStyle = '#7c4a4a';
+  ctx.beginPath();
+  ctx.ellipse(x, y + r * 0.2 * open, r * (0.4 + 0.4 * open), r * 0.8 * open, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#54302f';
+  ctx.beginPath();
+  ctx.ellipse(x, y + r * 0.35 * open, r * (0.2 + 0.25 * open), r * 0.45 * open, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// 画像モード：ホイール/ピンチで拡大縮小・ドラッグで位置調整
+const flatPointers = new Map();
+let pinchDist = 0;
+const flatView = () => settings.flatView || (settings.flatView = { zoom: 1, ox: 0, oy: 0 });
+
+flatCanvas.addEventListener('wheel', (e) => {
+  if (mode !== 'image') return;
+  e.preventDefault();
+  const v = flatView();
+  v.zoom = clamp(v.zoom * (e.deltaY < 0 ? 1.08 : 0.92), 0.35, 3.5);
+  saveSettings();
+}, { passive: false });
+
+flatCanvas.addEventListener('pointerdown', (e) => {
+  if (mode !== 'image') return;
+  flatPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (flatPointers.size === 2) {
+    const [a, b] = [...flatPointers.values()];
+    pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+  }
+  flatCanvas.setPointerCapture(e.pointerId);
+});
+flatCanvas.addEventListener('pointermove', (e) => {
+  if (!flatPointers.has(e.pointerId)) return;
+  const prev = flatPointers.get(e.pointerId);
+  flatPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const v = flatView();
+  if (flatPointers.size === 2) {
+    // ピンチで拡大縮小
+    const [a, b] = [...flatPointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinchDist > 0) v.zoom = clamp(v.zoom * d / pinchDist, 0.35, 3.5);
+    pinchDist = d;
+  } else {
+    v.ox += e.clientX - prev.x;
+    v.oy += e.clientY - prev.y;
+  }
+});
+const flatPointerEnd = (e) => {
+  flatPointers.delete(e.pointerId);
+  pinchDist = 0;
+  saveSettings();
+};
+flatCanvas.addEventListener('pointerup', flatPointerEnd);
+flatCanvas.addEventListener('pointercancel', flatPointerEnd);
+
+// ---------- UI: ファイル選択 / サンプル / D&D ----------
+$('btnFile').addEventListener('click', () => $('fileInput').click());
+$('fileInput').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (f) await loadAnyFile(f);
+  e.target.value = '';
+});
+
+async function loadAnyFile(f) {
+  if (f.name.toLowerCase().endsWith('.vrm')) {
+    try {
+      const buf = await f.arrayBuffer();
+      await loadVRMFromBuffer(buf);
+      idbPut({ kind: 'vrm', buf });
+    } catch (err) {
+      console.error(err);
+      setStatus('VRMの読み込みに失敗したわ… ファイル確認してな', 'err');
+    }
+  } else if (f.type.startsWith('image/')) {
+    await loadImageFile(f);
+  } else {
+    setStatus('.vrm か画像（PNG/JPG）を渡してな', 'warn');
+  }
+}
+
+$('btnCat').addEventListener('click', async () => {
+  try {
+    if (!window.CAT_AVATAR) { setStatus('ネコ素材（cat_assets.js）が見つからへん', 'err'); return; }
+    setStatus('ネコ準備中…');
+    const cat = window.CAT_AVATAR;
+    const buf = await (await fetch(cat.dataUrl)).arrayBuffer();
+    await activateImage({
+      kind: 'image', buf, mime: cat.mime || 'image/png',
+      crop: null, calib: cat.calib, bgRemove: cat.bgRemove !== false,
+    });
+  } catch (err) {
+    console.error(err);
+    setStatus('ネコの読み込みに失敗したわ…', 'err');
+  }
+});
+
+$('btnSample').addEventListener('click', async () => {
+  try {
+    setStatus('サンプルをダウンロード中…（約10MB）');
+    const buf = await (await fetch(SAMPLE_VRM_URL)).arrayBuffer();
+    await loadVRMFromBuffer(buf);
+    idbPut({ kind: 'vrm', buf });
+  } catch (err) {
+    console.error(err);
+    setStatus('サンプルの取得に失敗したわ… ネット接続を確認してな', 'err');
+  }
+});
+
+const dropOverlay = $('dropOverlay');
+addEventListener('dragover', (e) => { e.preventDefault(); dropOverlay.classList.add('on'); });
+addEventListener('dragleave', (e) => { if (!e.relatedTarget) dropOverlay.classList.remove('on'); });
+addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dropOverlay.classList.remove('on');
+  const f = e.dataTransfer.files[0];
+  if (f) await loadAnyFile(f);
+});
+
+// ---------- Webカメラ ----------
+let stream = null;
+let lastVideoTime = -1;
+
+async function startCamera(deviceId) {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    // facingMode: スマホでは内側カメラを使う（deviceId指定があればそっち優先）
+    video: { width: 640, height: 480, facingMode: 'user', ...(deviceId ? { deviceId: { exact: deviceId } } : {}) },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  lastVideoTime = -1;
+}
+
+async function fillCameraList() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === 'videoinput');
+  const sel = $('camSel');
+  sel.innerHTML = '';
+  cams.forEach((c, i) => {
+    const o = document.createElement('option');
+    o.value = c.deviceId;
+    o.textContent = c.label || `カメラ ${i + 1}`;
+    sel.appendChild(o);
+  });
+  const cur = stream?.getVideoTracks()[0]?.getSettings().deviceId;
+  if (cur) sel.value = cur;
+}
+$('camSel').addEventListener('change', async (e) => {
+  try { await startCamera(e.target.value); } catch { setStatus('カメラの切替に失敗したわ', 'err'); }
+});
+
+// ---------- MediaPipe FaceLandmarker ----------
+let landmarker = null;
+async function initLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(MP_WASM_URL);
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MP_MODEL_URL, delegate: 'GPU' },
+    runningMode: 'VIDEO',
+    numFaces: 1,
+  });
+}
+
+// ---------- トラッキング → アバター ----------
+// Kalidokit(VRM0時代の規約) → three-vrm正規化ボーン(VRM1規約) は X/Z の符号が反転する。
+// もし動きの向きがおかしかったら、パネルのチェックボックスで直せるで。
+const tmpEuler = new THREE.Euler();
+const tmpQuat = new THREE.Quaternion();
+const ZERO_ROT = { x: 0, y: 0, z: 0 };
+let lastFaceTime = 0;
+let lookYaw = 0, lookPitch = 0;
+
+function rigRot(boneName, rot, damp = 1, lerpAmt = 0.3) {
+  if (!currentVrm) return;
+  const node = currentVrm.humanoid.getNormalizedBoneNode(boneName);
+  if (!node) return;
+  tmpEuler.set(rot.x * damp, rot.y * damp, rot.z * damp, rot.rotationOrder || 'XYZ');
+  tmpQuat.setFromEuler(tmpEuler);
+  node.quaternion.slerp(tmpQuat, lerpAmt);
+}
+
+function setExpr(name, value, amt = 0.5) {
+  const em = currentVrm?.expressionManager;
+  if (!em || !em.expressionMap[name]) return false;
+  const cur = em.getValue(name) ?? 0;
+  em.setValue(name, lerp(cur, clamp(value, 0, 1), amt));
+  return true;
+}
+
+function solveBlink(rig, mirrored) {
+  const blink = Kalidokit.Face.stabilizeBlink(
+    { l: clamp(rig.eye.l, 0, 1), r: clamp(rig.eye.r, 0, 1) },
+    rig.head.y
+  );
+  const closedL = 1 - blink.l;
+  const closedR = 1 - blink.r;
+  // ミラー時は左右の目を入れ替え
+  return mirrored ? { aL: closedR, aR: closedL, closedL, closedR } : { aL: closedL, aR: closedR, closedL, closedR };
+}
+
+function applyFace(rig) {
+  const mirrored = $('chkMirror').checked;
+  const mir = mirrored ? 1 : -1;
+  const fx  = $('chkFlipX').checked ? -1 : 1;
+
+  if (mode === 'image') { applyFaceImage(rig, mirrored, mir, fx); return; }
+  if (!currentVrm) return;
+
+  // 頭・首・背骨（上ほど大きく追従）
+  const head = {
+    x: rig.head.x * -1 * fx,
+    y: rig.head.y * mir,
+    z: rig.head.z * -1 * mir,
+  };
+  rigRot('head',  head, 0.55, 0.35);
+  rigRot('neck',  head, 0.25, 0.3);
+  rigRot('spine', head, 0.10, 0.25);
+
+  // まばたき（首の角度でブレを補正）
+  const b = solveBlink(rig, mirrored);
+  const okL = setExpr('blinkLeft', b.aL, 0.7);
+  const okR = setExpr('blinkRight', b.aR, 0.7);
+  if (!okL || !okR) setExpr('blink', (b.closedL + b.closedR) / 2, 0.7);
+
+  // 口パク（あ・い・う・え・お）
+  const s = rig.mouth.shape;
+  setExpr('aa', s.A, 0.5);
+  setExpr('ih', s.I, 0.5);
+  setExpr('ou', s.U, 0.5);
+  setExpr('ee', s.E, 0.5);
+  setExpr('oh', s.O, 0.5);
+
+  // 目線
+  lookYaw   = lerp(lookYaw,   rig.pupil.x * 14 * mir, 0.4);
+  lookPitch = lerp(lookPitch, rig.pupil.y * 12, 0.4);
+}
+
+function applyFaceImage(rig, mirrored, mir, fx) {
+  flatTarget.tilt = clamp(rig.head.z, -0.6, 0.6) * -0.9 * mir;
+  flatTarget.sx   = clamp(rig.head.y, -0.6, 0.6) * 0.07 * mir;
+  flatTarget.sy   = clamp(rig.head.x, -0.6, 0.6) * -0.035 * fx;
+  const b = solveBlink(rig, mirrored);
+  flatTarget.blinkL = b.aL;
+  flatTarget.blinkR = b.aR;
+  flatTarget.mouth = clamp(Math.max(rig.mouth.shape.A, (rig.mouth.y ?? 0) * 0.8), 0, 1);
+}
+
+function relaxToNeutral() {
+  if (mode === 'image') {
+    for (const k in flatTarget) flatTarget[k] = lerp(flatTarget[k], 0, 0.08);
+    return;
+  }
+  rigRot('head', ZERO_ROT, 1, 0.06);
+  rigRot('neck', ZERO_ROT, 1, 0.06);
+  rigRot('spine', ZERO_ROT, 1, 0.06);
+  ['aa', 'ih', 'ou', 'ee', 'oh', 'blink', 'blinkLeft', 'blinkRight'].forEach((n) => setExpr(n, 0, 0.08));
+  lookYaw = lerp(lookYaw, 0, 0.08);
+  lookPitch = lerp(lookPitch, 0, 0.08);
+}
+
+// ---------- メインループ ----------
+const clock = new THREE.Clock();
+let trackingShown = false;
+
+function tick() {
+  const delta = clock.getDelta();
+  const now = performance.now();
+
+  // 顔検出（ビデオの新フレームのみ）
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    const lm = res.faceLandmarks?.[0];
+    if (lm) {
+      lastFaceTime = now;
+      const rig = Kalidokit.Face.solve(lm, { runtime: 'mediapipe', video });
+      if (rig) applyFace(rig);
+      if (!trackingShown) { setStatus('トラッキング中 ✔'); trackingShown = true; }
+    }
+  }
+  if (trackingShown && now - lastFaceTime > 1500) {
+    setStatus('顔が見えへん… カメラに映ってな', 'warn');
+    trackingShown = false;
+  }
+  if (now - lastFaceTime > 800) relaxToNeutral();
+
+  if (mode === 'vrm' && currentVrm) {
+    // 呼吸（じっとしてても生きてる感を出す）
+    const breath = Math.sin(clock.elapsedTime * 2 * Math.PI / 4.2);
+    rigRot('chest', { x: 0.02 * breath, y: 0, z: 0 }, 1, 0.5);
+
+    currentVrm.update(delta);
+    currentVrm.lookAt?.applier?.applyYawPitch(lookYaw, lookPitch);
+    controls.update();
+    renderer.render(scene, camera3);
+  } else if (mode === 'image') {
+    renderFlat();
+  } else {
+    controls.update();
+    renderer.render(scene, camera3);
+  }
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  tick();
+}
+
+// タブが裏に回ってもOBS用に描画を続ける
+setInterval(() => { if (document.hidden) tick(); }, 33);
+
+// 動作確認用フック
+window.__vt = { applyFace, activateImage, getMode: () => mode };
+
+// ---------- パネル表示切替 ----------
+function applyPip() {
+  video.style.visibility = $('chkPip').checked ? 'visible' : 'hidden';
+}
+$('chkPip').addEventListener('change', applyPip);
+addEventListener('keydown', (e) => {
+  if (e.key.toLowerCase() === 'h' && !e.repeat) {
+    const hide = panel.style.display !== 'none';
+    panel.style.display = hide ? 'none' : '';
+    video.style.visibility = hide ? 'hidden' : ($('chkPip').checked ? 'visible' : 'hidden');
+  }
+});
+if (params.get('ui') === '0') panel.style.display = 'none';
+
+// ---------- 起動 ----------
+// スマホで画面が消灯せえへんようにする
+async function keepAwake() {
+  try { await navigator.wakeLock?.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) keepAwake(); });
+
+async function main() {
+  loop();
+  keepAwake();
+
+  // アバター復元（前回のファイル or URLパラメータ）
+  (async () => {
+    try {
+      if (params.get('vrm')) { await loadVRMFromURL(params.get('vrm')); return; }
+      const saved = await idbGet();
+      if (saved instanceof ArrayBuffer) { await loadVRMFromBuffer(saved); }       // 旧形式
+      else if (saved?.kind === 'vrm') { await loadVRMFromBuffer(saved.buf); }
+      else if (saved?.kind === 'image') { await activateImage(saved, { save: false }); }
+      else setStatus('アバター未読込 — 画像かVRMをドロップしてな（3Dサンプルもあるで）', 'warn');
+    } catch (e) {
+      console.error(e);
+      setStatus('アバターの復元に失敗したわ', 'err');
+    }
+  })();
+
+  // 顔認識エンジン
+  const lmReady = initLandmarker().catch((e) => {
+    console.error(e);
+    setStatus('顔認識エンジンの読み込みに失敗… ネット接続を確認してな', 'err');
+  });
+
+  // カメラ
+  try {
+    await startCamera(settings.cameraId);
+    await fillCameraList();
+    const sel = $('camSel');
+    sel.addEventListener('change', () => { settings.cameraId = sel.value; saveSettings(); });
+  } catch (e) {
+    console.error(e);
+    setStatus('カメラにアクセスできへん… ブラウザの許可設定を確認してな', 'err');
+    $('camSel').innerHTML = '<option>カメラなし</option>';
+  }
+
+  await lmReady;
+}
+
+main();
+</script>
+</body>
+</html>
