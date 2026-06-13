@@ -24,11 +24,21 @@
     backdrop-filter: blur(8px); font-size: 13px; line-height: 1.7;
     box-shadow: 0 6px 24px rgba(0,0,0,.35);
   }
-  #panel h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .03em; }
+  #panel h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .03em; padding-right: 36px; }
   #panel h1 small { font-size: 10px; color: #8fa3c8; font-weight: normal; margin-left: 6px; }
   #status { font-size: 12px; color: #9fe6b0; min-height: 1.5em; margin-bottom: 8px; }
   #status.err { color: #ff9d9d; }
   #status.warn { color: #ffd98a; }
+
+  /* パネル開閉トグル */
+  #panelToggle {
+    position: absolute; top: 11px; right: 12px; width: 30px; height: 26px;
+    flex: none; padding: 0; font-size: 13px; line-height: 1; background: #2a2e3e;
+  }
+  #panelToggle:hover { background: #3a4058; }
+  #panel.collapsed { padding-bottom: 11px; }
+  #panel.collapsed #status { margin-bottom: 0; }
+  #panel.collapsed #panelBody { display: none; }
 
   .row { display: flex; gap: 8px; margin-bottom: 8px; }
   button {
@@ -48,6 +58,9 @@
 
   .imgOnly { display: none; }
   body[data-mode="image"] .imgOnly { display: flex; }
+  button.loaded { background: #2c7a4b; }
+  button.loaded:hover { background: #348a57; }
+  .sectionLabel { font-size: 11px; color: #8fa3c8; margin: 6px 0 2px; }
 
   details { margin-top: 8px; font-size: 12px; }
   details summary { cursor: pointer; color: #a9c4ff; }
@@ -77,8 +90,9 @@
 
   /* スマホ対応 */
   @media (max-width: 480px) {
-    #panel { width: calc(100vw - 28px); max-height: 62vh; overflow-y: auto; box-sizing: border-box; }
-    #cam { width: 104px; }
+    #panel { width: calc(100vw - 24px); max-height: 78vh; overflow-y: auto; box-sizing: border-box; left: 12px; top: 12px; }
+    #panel.collapsed { overflow: visible; }
+    #cam { width: 96px; }
     #edBtns button { min-width: 90px; }
   }
 </style>
@@ -89,9 +103,11 @@
 <video id="cam" autoplay playsinline muted></video>
 
 <div id="panel">
+  <button id="panelToggle" title="パネルを開閉">▲</button>
   <h1>アバター通話<small>face tracking vtuber</small></h1>
   <div id="status">初期化中…</div>
 
+  <div id="panelBody">
   <div class="row">
     <button id="btnCat">ネコアバター</button>
     <button id="btnFile" class="sub">ファイルを開く</button>
@@ -100,9 +116,17 @@
     <button id="btnSample" class="sub">3Dサンプル（VRM）</button>
   </div>
   <input type="file" id="fileInput" accept=".vrm,image/png,image/jpeg,image/webp" hidden>
+  <input type="file" id="layerInput" accept="image/png,image/jpeg,image/webp" hidden>
 
-  <div class="row imgOnly">
-    <button id="btnRecalib" class="sub">範囲・目・口を再設定</button>
+  <div class="imgOnly" style="flex-direction:column">
+    <div class="sectionLabel">口・目を“本物の絵”で動かす（差分画像）</div>
+    <div class="row" style="margin-bottom:6px">
+      <button id="btnMouthLayer" class="sub">口あけ画像</button>
+      <button id="btnEyesLayer" class="sub">目とじ画像</button>
+    </div>
+    <div class="row">
+      <button id="btnRecalib" class="sub">範囲・目・口を再設定</button>
+    </div>
   </div>
   <label class="line imgOnly"><input type="checkbox" id="chkBgRemove" checked> 背景を自動で透過する</label>
 
@@ -147,6 +171,7 @@
   </details>
 
   <div class="hint">Hキー：パネル表示切替　／　VRMでも画像（PNG/JPG）でもドラッグ&ドロップで読み込めるで。画像はホイールで拡大縮小・ドラッグで位置調整や。</div>
+  </div><!-- /panelBody -->
 </div>
 
 <div id="dropOverlay">ここにドロップ！（.vrm / 画像）</div>
@@ -211,11 +236,17 @@ function saveSettings() {
 
 // ---------- モード（vrm / image） ----------
 let mode = 'none';
+let autoCollapsedOnce = false;
 function setMode(m) {
   mode = m;
   document.body.dataset.mode = m;
   renderer.domElement.style.display = m === 'vrm' ? '' : 'none';
   $('flat').style.display = m === 'image' ? 'block' : 'none';
+  // スマホで初めてアバターが出たら、自動でパネルを畳んで全身見えるように
+  if (m !== 'none' && !autoCollapsedOnce && innerWidth <= 480 && settings.panelCollapsed === undefined) {
+    autoCollapsedOnce = true;
+    setPanelCollapsed(true);
+  }
 }
 
 // ---------- three.js ----------
@@ -343,6 +374,8 @@ const flatCtx = flatCanvas.getContext('2d');
 const flatAvatar = {
   raw: null,     // 切り抜き直後（透過処理前）
   sprite: null,  // 表示用（透過処理後）
+  mouthOpenSprite: null,  // 差分: 口あけフレーム
+  eyesClosedSprite: null, // 差分: 目とじフレーム
   calib: null,   // {le,re,m} 画像内の正規化座標
   eyeR: 10, mouthR: 12,
   lidColorL: '#e8e4de', lidColorR: '#e8e4de',
@@ -418,7 +451,7 @@ function computeFaceMetrics() {
   const m  = { x: calib.m.x * w,  y: calib.m.y * h };
   const d = Math.max(Math.hypot(re.x - le.x, re.y - le.y), 8);
   flatAvatar.eyeR = d * 0.30;
-  flatAvatar.mouthR = d * 0.36;
+  flatAvatar.mouthR = d * 0.26;
   flatAvatar.px = { le, re, m };
 
   const ctx = sprite.getContext('2d');
@@ -441,8 +474,24 @@ function computeFaceMetrics() {
   flatAvatar.lidColorR = sample(re, flatAvatar.eyeR);
 }
 
+// 差分フレーム（口あけ/目とじ）をベースと同じ切り抜き・透過で用意する
+async function buildLayerSprite(buf, mime, record) {
+  const bmp = await createImageBitmap(new Blob([buf], { type: mime || 'image/png' }));
+  // 元画像と同サイズの編集物ならベースと同じcropを適用、それ以外は全体を使う
+  let sx = 0, sy = 0, sw = bmp.width, sh = bmp.height;
+  if (record.crop && bmp.width === record.origW && bmp.height === record.origH) {
+    ({ x: sx, y: sy, w: sw, h: sh } = record.crop);
+  }
+  const c = document.createElement('canvas');
+  c.width = sw; c.height = sh;
+  c.getContext('2d').drawImage(bmp, sx, sy, sw, sh, 0, 0, sw, sh);
+  if (record.bgRemove !== false) removeBackground(c);
+  return c;
+}
+
 async function activateImage(record, { save = true } = {}) {
   const bmp = await createImageBitmap(new Blob([record.buf], { type: record.mime || 'image/png' }));
+  record.origW = bmp.width; record.origH = bmp.height;
   const crop = record.crop || { x: 0, y: 0, w: bmp.width, h: bmp.height };
   const raw = document.createElement('canvas');
   raw.width = crop.w; raw.height = crop.h;
@@ -451,12 +500,65 @@ async function activateImage(record, { save = true } = {}) {
   flatAvatar.calib = record.calib || { le: { x: 0.4, y: 0.35 }, re: { x: 0.6, y: 0.35 }, m: { x: 0.5, y: 0.55 } };
   rebuildSprite(record.bgRemove !== false);
   computeFaceMetrics();
+
+  // 差分フレームを構築
+  flatAvatar.mouthOpenSprite  = record.mouthOpenBuf  ? await buildLayerSprite(record.mouthOpenBuf,  record.mouthOpenMime,  record) : null;
+  flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildLayerSprite(record.eyesClosedBuf, record.eyesClosedMime, record) : null;
+  refreshLayerButtons();
+
   $('chkBgRemove').checked = record.bgRemove !== false;
   currentRecord = record;
   setMode('image');
   if (save) idbPut(record);
   setStatus('画像アバター設定完了！');
 }
+
+function refreshLayerButtons() {
+  const mb = $('btnMouthLayer'), eb = $('btnEyesLayer');
+  if (mb) { mb.classList.toggle('loaded', !!flatAvatar.mouthOpenSprite); mb.textContent = flatAvatar.mouthOpenSprite ? '口あけ ✔' : '口あけ画像'; }
+  if (eb) { eb.classList.toggle('loaded', !!flatAvatar.eyesClosedSprite); eb.textContent = flatAvatar.eyesClosedSprite ? '目とじ ✔' : '目とじ画像'; }
+}
+
+// 差分フレームの読み込み（口あけ / 目とじ）
+let layerKind = null;
+$('btnMouthLayer').addEventListener('click', () => { layerKind = 'mouth'; $('layerInput').click(); });
+$('btnEyesLayer').addEventListener('click', () => { layerKind = 'eyes'; $('layerInput').click(); });
+$('layerInput').addEventListener('click', (e) => {
+  // 既に読み込み済みなら、もう一度押したら解除するか確認
+  const has = layerKind === 'mouth' ? flatAvatar.mouthOpenSprite : flatAvatar.eyesClosedSprite;
+  if (has) {
+    e.preventDefault();
+    if (confirm(layerKind === 'mouth' ? '口あけ画像を外す？（もう一度選ぶなら「キャンセル」）' : '目とじ画像を外す？（もう一度選ぶなら「キャンセル」）')) {
+      if (!currentRecord) return;
+      if (layerKind === 'mouth') { delete currentRecord.mouthOpenBuf; delete currentRecord.mouthOpenMime; flatAvatar.mouthOpenSprite = null; }
+      else { delete currentRecord.eyesClosedBuf; delete currentRecord.eyesClosedMime; flatAvatar.eyesClosedSprite = null; }
+      refreshLayerButtons(); idbPut(currentRecord);
+      setStatus('差分画像を外したで');
+    } else {
+      $('layerInput').value = '';
+      $('layerInput').click(); // 選び直し
+    }
+  }
+});
+$('layerInput').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f || !currentRecord) return;
+  try {
+    const buf = await f.arrayBuffer();
+    if (layerKind === 'mouth') { currentRecord.mouthOpenBuf = buf; currentRecord.mouthOpenMime = f.type; }
+    else { currentRecord.eyesClosedBuf = buf; currentRecord.eyesClosedMime = f.type; }
+    const sprite = await buildLayerSprite(buf, f.type, currentRecord);
+    if (layerKind === 'mouth') flatAvatar.mouthOpenSprite = sprite;
+    else flatAvatar.eyesClosedSprite = sprite;
+    refreshLayerButtons();
+    idbPut(currentRecord);
+    setStatus(layerKind === 'mouth' ? '口あけ画像を設定したで！喋ってみて' : '目とじ画像を設定したで！まばたきしてみて');
+  } catch (err) {
+    console.error(err);
+    setStatus('差分画像の読み込みに失敗したわ…', 'err');
+  }
+});
 
 $('chkBgRemove').addEventListener('change', (e) => {
   if (!currentRecord || mode !== 'image') return;
@@ -671,15 +773,34 @@ function renderFlat() {
   ctx.scale(scale, scale);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(s, -s.width / 2, -s.height / 2);
+  const ox = -s.width / 2, oy = -s.height / 2;
+  ctx.drawImage(s, ox, oy, s.width, s.height);
 
-  // まぶた・口のオーバーレイ（画像座標系で描く）
+  const hasMouthLayer = !!flatAvatar.mouthOpenSprite;
+  const hasEyesLayer = !!flatAvatar.eyesClosedSprite;
+
+  // 差分フレームをクロスフェード（本物の絵で口・目を動かす）
+  if (hasEyesLayer) {
+    // 目とじフレームは1枚なので両目まとめて。小さい値はノイズなので切り、しきい値超えでパッと閉じる
+    const raw = Math.max(flatState.blinkL, flatState.blinkR);
+    const a = clamp((raw - 0.32) / 0.45, 0, 1);
+    if (a > 0.01) { ctx.globalAlpha = a; ctx.drawImage(flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height); ctx.globalAlpha = 1; }
+  }
+  if (hasMouthLayer) {
+    const a = clamp((flatState.mouth - 0.08) / 0.7, 0, 1);
+    if (a > 0.01) { ctx.globalAlpha = a; ctx.drawImage(flatAvatar.mouthOpenSprite, ox, oy, s.width, s.height); ctx.globalAlpha = 1; }
+  }
+
+  // 差分画像が無い部位だけ、描き足しでフォールバック
   if (flatAvatar.px) {
     const { le, re, m } = flatAvatar.px;
-    const ox = -s.width / 2, oy = -s.height / 2;
-    drawLid(ctx, le.x + ox, le.y + oy, flatAvatar.eyeR, flatState.blinkL, flatAvatar.lidColorL);
-    drawLid(ctx, re.x + ox, re.y + oy, flatAvatar.eyeR, flatState.blinkR, flatAvatar.lidColorR);
-    drawMouth(ctx, m.x + ox, m.y + oy, flatAvatar.mouthR, flatState.mouth);
+    if (!hasEyesLayer) {
+      drawLid(ctx, le.x + ox, le.y + oy, flatAvatar.eyeR, flatState.blinkL, flatAvatar.lidColorL);
+      drawLid(ctx, re.x + ox, re.y + oy, flatAvatar.eyeR, flatState.blinkR, flatAvatar.lidColorR);
+    }
+    if (!hasMouthLayer) {
+      drawMouth(ctx, m.x + ox, m.y + oy, flatAvatar.mouthR, flatState.mouth);
+    }
   }
   ctx.restore();
 }
@@ -699,16 +820,28 @@ function drawLid(ctx, x, y, r, closed, color) {
   }
 }
 
+// 描き足しの口（差分画像が無いとき用のフォールバック。控えめに）
 function drawMouth(ctx, x, y, r, open) {
-  if (open < 0.07) return;
-  ctx.fillStyle = '#7c4a4a';
+  if (open < 0.05) return;
+  const o = clamp(open, 0, 1);
+  const w = r * (0.30 + 0.10 * o);
+  const h = r * (0.10 + 0.62 * o);
+  ctx.save();
+  ctx.translate(x, y + r * 0.04);
+  // 口の中（やや暗いふちをぼかして馴染ませる）
+  ctx.shadowColor = 'rgba(40,22,24,0.5)';
+  ctx.shadowBlur = r * 0.18;
+  ctx.fillStyle = `rgba(58,30,32,${0.5 + 0.42 * o})`;
   ctx.beginPath();
-  ctx.ellipse(x, y + r * 0.2 * open, r * (0.4 + 0.4 * open), r * 0.8 * open, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, h * 0.1, w, h, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = '#54302f';
+  ctx.shadowBlur = 0;
+  // 下唇/舌のうっすらピンク
+  ctx.fillStyle = `rgba(196,120,118,${0.45 * o})`;
   ctx.beginPath();
-  ctx.ellipse(x, y + r * 0.35 * open, r * (0.2 + 0.25 * open), r * 0.45 * open, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, h * 0.5, w * 0.68, h * 0.42, 0, 0, Math.PI * 2);
   ctx.fill();
+  ctx.restore();
 }
 
 // 画像モード：ホイール/ピンチで拡大縮小・ドラッグで位置調整
@@ -1029,6 +1162,17 @@ addEventListener('keydown', (e) => {
   }
 });
 if (params.get('ui') === '0') panel.style.display = 'none';
+
+// パネルの開閉（畳むと上部の小さいバーだけ残る）
+function setPanelCollapsed(collapsed) {
+  panel.classList.toggle('collapsed', collapsed);
+  $('panelToggle').textContent = collapsed ? '▼' : '▲';
+  $('panelToggle').title = collapsed ? 'パネルを開く' : 'パネルを畳む';
+  settings.panelCollapsed = collapsed;
+  saveSettings();
+}
+$('panelToggle').addEventListener('click', () => setPanelCollapsed(!panel.classList.contains('collapsed')));
+if (settings.panelCollapsed) setPanelCollapsed(true);
 
 // ---------- 起動 ----------
 // スマホで画面が消灯せえへんようにする
