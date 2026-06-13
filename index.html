@@ -119,13 +119,12 @@
   <input type="file" id="layerInput" accept="image/png,image/jpeg,image/webp" hidden>
 
   <div class="imgOnly" style="flex-direction:column">
-    <div class="sectionLabel">口・目を“本物の絵”で動かす（差分画像）</div>
     <div class="row" style="margin-bottom:6px">
-      <button id="btnMouthLayer" class="sub">口あけ画像</button>
-      <button id="btnEyesLayer" class="sub">目とじ画像</button>
-    </div>
-    <div class="row">
       <button id="btnRecalib" class="sub">範囲・目・口を再設定</button>
+    </div>
+    <div class="sectionLabel">（任意）目を“本物の絵”で閉じる差分画像</div>
+    <div class="row">
+      <button id="btnEyesLayer" class="sub">目とじ画像</button>
     </div>
   </div>
   <label class="line imgOnly"><input type="checkbox" id="chkBgRemove" checked> 背景を自動で透過する</label>
@@ -502,8 +501,8 @@ async function activateImage(record, { save = true } = {}) {
   rebuildSprite(record.bgRemove !== false);
   computeFaceMetrics();
 
-  // 差分フレームを構築
-  flatAvatar.mouthOpenSprite  = record.mouthOpenBuf  ? await buildLayerSprite(record.mouthOpenBuf,  record.mouthOpenMime,  record) : null;
+  // 目とじ差分フレーム（任意）。口は差分不要でベース画像から変形する。
+  flatAvatar.mouthOpenSprite = null;
   flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildLayerSprite(record.eyesClosedBuf, record.eyesClosedMime, record) : null;
   refreshLayerButtons();
 
@@ -515,26 +514,22 @@ async function activateImage(record, { save = true } = {}) {
 }
 
 function refreshLayerButtons() {
-  const mb = $('btnMouthLayer'), eb = $('btnEyesLayer');
-  if (mb) { mb.classList.toggle('loaded', !!flatAvatar.mouthOpenSprite); mb.textContent = flatAvatar.mouthOpenSprite ? '口あけ ✔' : '口あけ画像'; }
+  const eb = $('btnEyesLayer');
   if (eb) { eb.classList.toggle('loaded', !!flatAvatar.eyesClosedSprite); eb.textContent = flatAvatar.eyesClosedSprite ? '目とじ ✔' : '目とじ画像'; }
 }
 
-// 差分フレームの読み込み（口あけ / 目とじ）
+// 差分フレームの読み込み（目とじ・任意）
 let layerKind = null;
-$('btnMouthLayer').addEventListener('click', () => { layerKind = 'mouth'; $('layerInput').click(); });
 $('btnEyesLayer').addEventListener('click', () => { layerKind = 'eyes'; $('layerInput').click(); });
 $('layerInput').addEventListener('click', (e) => {
   // 既に読み込み済みなら、もう一度押したら解除するか確認
-  const has = layerKind === 'mouth' ? flatAvatar.mouthOpenSprite : flatAvatar.eyesClosedSprite;
-  if (has) {
+  if (flatAvatar.eyesClosedSprite) {
     e.preventDefault();
-    if (confirm(layerKind === 'mouth' ? '口あけ画像を外す？（もう一度選ぶなら「キャンセル」）' : '目とじ画像を外す？（もう一度選ぶなら「キャンセル」）')) {
+    if (confirm('目とじ画像を外す？（もう一度選ぶなら「キャンセル」）')) {
       if (!currentRecord) return;
-      if (layerKind === 'mouth') { delete currentRecord.mouthOpenBuf; delete currentRecord.mouthOpenMime; flatAvatar.mouthOpenSprite = null; }
-      else { delete currentRecord.eyesClosedBuf; delete currentRecord.eyesClosedMime; flatAvatar.eyesClosedSprite = null; }
+      delete currentRecord.eyesClosedBuf; delete currentRecord.eyesClosedMime; flatAvatar.eyesClosedSprite = null;
       refreshLayerButtons(); idbPut(currentRecord);
-      setStatus('差分画像を外したで');
+      setStatus('目とじ画像を外したで');
     } else {
       $('layerInput').value = '';
       $('layerInput').click(); // 選び直し
@@ -547,14 +542,11 @@ $('layerInput').addEventListener('change', async (e) => {
   if (!f || !currentRecord) return;
   try {
     const buf = await f.arrayBuffer();
-    if (layerKind === 'mouth') { currentRecord.mouthOpenBuf = buf; currentRecord.mouthOpenMime = f.type; }
-    else { currentRecord.eyesClosedBuf = buf; currentRecord.eyesClosedMime = f.type; }
-    const sprite = await buildLayerSprite(buf, f.type, currentRecord);
-    if (layerKind === 'mouth') flatAvatar.mouthOpenSprite = sprite;
-    else flatAvatar.eyesClosedSprite = sprite;
+    currentRecord.eyesClosedBuf = buf; currentRecord.eyesClosedMime = f.type;
+    flatAvatar.eyesClosedSprite = await buildLayerSprite(buf, f.type, currentRecord);
     refreshLayerButtons();
     idbPut(currentRecord);
-    setStatus(layerKind === 'mouth' ? '口あけ画像を設定したで！喋ってみて' : '目とじ画像を設定したで！まばたきしてみて');
+    setStatus('目とじ画像を設定したで！まばたきしてみて');
   } catch (err) {
     console.error(err);
     setStatus('差分画像の読み込みに失敗したわ…', 'err');
@@ -744,11 +736,9 @@ $('btnRecalib').addEventListener('click', async () => {
   await activateImage(currentRecord);
 });
 
-// 差分フレームを「指定領域だけ」フチをぼかして合成する。
-// 画面全体で重ねると背景や輪郭のズレがゴースト表示されるので、口/目の周りだけに限定する。
+// オフスクリーンcanvas（差分合成・口の変形で共用）
 let _layerCv = null, _layerCx = null, _maskCv = null, _maskCx = null;
-function drawMaskedLayer(ctx, layer, ox, oy, w, h, regions, alpha) {
-  if (alpha <= 0.01) return;
+function ensureOffscreen(w, h) {
   if (!_layerCv) {
     _layerCv = document.createElement('canvas'); _layerCx = _layerCv.getContext('2d');
     _maskCv = document.createElement('canvas'); _maskCx = _maskCv.getContext('2d');
@@ -756,6 +746,73 @@ function drawMaskedLayer(ctx, layer, ox, oy, w, h, regions, alpha) {
   if (_layerCv.width !== w || _layerCv.height !== h) {
     _layerCv.width = w; _layerCv.height = h; _maskCv.width = w; _maskCv.height = h;
   }
+}
+
+// 口を「開けた量だけ」実際に開く（パペット方式）。
+// ベース画像の上唇から下を、開けた量に比例して下にずらし、空いた隙間に口の中を描く。
+// → フェードではなく、口の開き具合とリアルタイムに連動して猫の口が開く。
+function drawJawDrop(ctx, base, ox, oy, w, h, m, d, openRaw) {
+  const open = clamp((openRaw - 0.05) / 0.82, 0, 1);
+  if (open <= 0.02) return;
+  ensureOffscreen(w, h);
+  const lx = _layerCx, mx2 = _maskCx;
+
+  const muzzleW = d * 1.5;           // 動かす口元の幅
+  const x0 = m.x - muzzleW / 2;
+  const yLip = m.y - d * 0.04;       // 上唇ライン（ここから下が下あご）
+  const maxDrop = d * 0.5;
+  const drop = open * maxDrop;
+  const cavTop = yLip;
+  const cavBot = yLip + drop;
+  const halfW = muzzleW * 0.26;      // 口の横幅の半分（猫の口は細め）
+
+  lx.setTransform(1, 0, 0, 1, 0, 0);
+  lx.clearRect(0, 0, w, h);
+
+  // 1) 口の中（キャビティ）。開くほど縦に伸びる楕円。
+  const midY = (cavTop + cavBot) / 2;
+  const g = lx.createLinearGradient(0, cavTop, 0, cavBot);
+  g.addColorStop(0, '#241011');     // 上（口蓋）は暗い
+  g.addColorStop(1, '#62322e');
+  lx.fillStyle = g;
+  lx.beginPath();
+  lx.ellipse(m.x, midY, halfW, Math.max(drop / 2, 0.5), 0, 0, Math.PI * 2);
+  lx.fill();
+  // 舌／下唇のピンク（下のほうにうっすら）
+  if (drop > d * 0.14) {
+    lx.fillStyle = 'rgba(206,128,124,0.85)';
+    lx.beginPath();
+    lx.ellipse(m.x, cavBot - drop * 0.22, halfW * 0.66, Math.min(drop * 0.30, d * 0.16), 0, 0, Math.PI * 2);
+    lx.fill();
+  }
+
+  // 2) 下あごスライス：ベースの上唇から下を、drop分だけ下にずらして描く
+  const sliceH = h - yLip;
+  lx.imageSmoothingEnabled = true;
+  lx.drawImage(base, x0, yLip, muzzleW, sliceH, x0, yLip + drop, muzzleW, sliceH);
+
+  // 3) 横方向フェザーのマスクで口元バンドだけ残す（頬や髭の境目を馴染ませる）
+  mx2.setTransform(1, 0, 0, 1, 0, 0);
+  mx2.clearRect(0, 0, w, h);
+  const mg = mx2.createLinearGradient(x0, 0, x0 + muzzleW, 0);
+  mg.addColorStop(0, 'rgba(0,0,0,0)');
+  mg.addColorStop(0.20, 'rgba(0,0,0,1)');
+  mg.addColorStop(0.80, 'rgba(0,0,0,1)');
+  mg.addColorStop(1, 'rgba(0,0,0,0)');
+  mx2.fillStyle = mg;
+  mx2.fillRect(x0, yLip, muzzleW, h - yLip);
+  lx.globalCompositeOperation = 'destination-in';
+  lx.drawImage(_maskCv, 0, 0);
+  lx.globalCompositeOperation = 'source-over';
+
+  // ベースの上にそのまま重ねる（フェードではなく形の置き換え）
+  ctx.drawImage(_layerCv, ox, oy, w, h);
+}
+
+// 差分フレームを「指定領域だけ」フチをぼかして合成する（目とじ等）。
+function drawMaskedLayer(ctx, layer, ox, oy, w, h, regions, alpha) {
+  if (alpha <= 0.01) return;
+  ensureOffscreen(w, h);
   // マスク（複数領域の和）をふわっとした楕円グラデで作る
   _maskCx.setTransform(1, 0, 0, 1, 0, 0);
   _maskCx.clearRect(0, 0, w, h);
@@ -802,6 +859,7 @@ function renderFlat() {
 
   // なめらかに追従
   for (const k in flatState) flatState[k] = lerp(flatState[k], flatTarget[k], 0.28);
+  if (__freezeMouth != null) { flatState.mouth = __freezeMouth; flatTarget.mouth = __freezeMouth; }
 
   const view = settings.flatView || { zoom: 1, ox: 0, oy: 0 };
   const breath = 1 + 0.006 * Math.sin(clock.elapsedTime * 2 * Math.PI / 4.2);
@@ -819,39 +877,25 @@ function renderFlat() {
   const ox = -s.width / 2, oy = -s.height / 2;
   ctx.drawImage(s, ox, oy, s.width, s.height);
 
-  const hasMouthLayer = !!flatAvatar.mouthOpenSprite;
   const hasEyesLayer = !!flatAvatar.eyesClosedSprite;
   const px = flatAvatar.px;
   const d = flatAvatar.eyeDist || 40;
 
-  // 差分フレームをクロスフェード（本物の絵で口・目を動かす）
-  // ※ 口/目の周りだけに限定して合成する。全体で重ねると背景・輪郭のズレがゴーストになる。
-  if (hasEyesLayer && px) {
-    // 目とじフレームは1枚なので両目まとめて。小さい値はノイズなので切り、しきい値超えでパッと閉じる
-    const raw = Math.max(flatState.blinkL, flatState.blinkR);
-    const a = clamp((raw - 0.30) / 0.42, 0, 1);
-    drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
-      { x: px.le.x, y: px.le.y, rx: d * 0.50, ry: d * 0.42 },
-      { x: px.re.x, y: px.re.y, rx: d * 0.50, ry: d * 0.42 },
-    ], a);
-  }
-  if (hasMouthLayer && px) {
-    const a = clamp((flatState.mouth - 0.06) / 0.6, 0, 1);
-    drawMaskedLayer(ctx, flatAvatar.mouthOpenSprite, ox, oy, s.width, s.height, [
-      // 口は下に大きく開くので、口点より少し下を中心に縦長の領域
-      { x: px.m.x, y: px.m.y + d * 0.22, rx: d * 0.60, ry: d * 0.85 },
-    ], a);
-  }
+  if (px) {
+    // 口：開けた量だけベース画像の下あごを実際に下げて開く（フェードやない）
+    drawJawDrop(ctx, s, ox, oy, s.width, s.height, px.m, d, flatState.mouth);
 
-  // 差分画像が無い部位だけ、描き足しでフォールバック
-  if (flatAvatar.px) {
-    const { le, re, m } = flatAvatar.px;
-    if (!hasEyesLayer) {
-      drawLid(ctx, le.x + ox, le.y + oy, flatAvatar.eyeR, flatState.blinkL, flatAvatar.lidColorL);
-      drawLid(ctx, re.x + ox, re.y + oy, flatAvatar.eyeR, flatState.blinkR, flatAvatar.lidColorR);
-    }
-    if (!hasMouthLayer) {
-      drawMouth(ctx, m.x + ox, m.y + oy, flatAvatar.mouthR, flatState.mouth);
+    // 目：差分画像があれば目の周りだけクロスフェード、無ければまぶたを描き足し（どちらも開閉量に比例）
+    if (hasEyesLayer) {
+      const raw = Math.max(flatState.blinkL, flatState.blinkR);
+      const a = clamp((raw - 0.30) / 0.42, 0, 1);
+      drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
+        { x: px.le.x, y: px.le.y, rx: d * 0.50, ry: d * 0.42 },
+        { x: px.re.x, y: px.re.y, rx: d * 0.50, ry: d * 0.42 },
+      ], a);
+    } else {
+      drawLid(ctx, px.le.x + ox, px.le.y + oy, flatAvatar.eyeR, flatState.blinkL, flatAvatar.lidColorL);
+      drawLid(ctx, px.re.x + ox, px.re.y + oy, flatAvatar.eyeR, flatState.blinkR, flatAvatar.lidColorR);
     }
   }
   ctx.restore();
@@ -1199,7 +1243,9 @@ function loop() {
 setInterval(() => { if (document.hidden) tick(); }, 33);
 
 // 動作確認用フック
-window.__vt = { applyFace, activateImage, getMode: () => mode };
+let __freezeMouth = null; // テスト用：口の開きを固定
+window.__vt = { applyFace, activateImage, getMode: () => mode,
+  freezeMouth: (v) => { __freezeMouth = v; } };
 
 // ---------- パネル表示切替 ----------
 function applyPip() {
