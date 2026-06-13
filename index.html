@@ -450,6 +450,7 @@ function computeFaceMetrics() {
   const re = { x: calib.re.x * w, y: calib.re.y * h };
   const m  = { x: calib.m.x * w,  y: calib.m.y * h };
   const d = Math.max(Math.hypot(re.x - le.x, re.y - le.y), 8);
+  flatAvatar.eyeDist = d;
   flatAvatar.eyeR = d * 0.30;
   flatAvatar.mouthR = d * 0.26;
   flatAvatar.px = { le, re, m };
@@ -743,6 +744,48 @@ $('btnRecalib').addEventListener('click', async () => {
   await activateImage(currentRecord);
 });
 
+// 差分フレームを「指定領域だけ」フチをぼかして合成する。
+// 画面全体で重ねると背景や輪郭のズレがゴースト表示されるので、口/目の周りだけに限定する。
+let _layerCv = null, _layerCx = null, _maskCv = null, _maskCx = null;
+function drawMaskedLayer(ctx, layer, ox, oy, w, h, regions, alpha) {
+  if (alpha <= 0.01) return;
+  if (!_layerCv) {
+    _layerCv = document.createElement('canvas'); _layerCx = _layerCv.getContext('2d');
+    _maskCv = document.createElement('canvas'); _maskCx = _maskCv.getContext('2d');
+  }
+  if (_layerCv.width !== w || _layerCv.height !== h) {
+    _layerCv.width = w; _layerCv.height = h; _maskCv.width = w; _maskCv.height = h;
+  }
+  // マスク（複数領域の和）をふわっとした楕円グラデで作る
+  _maskCx.setTransform(1, 0, 0, 1, 0, 0);
+  _maskCx.clearRect(0, 0, w, h);
+  for (const rg of regions) {
+    const R = Math.max(rg.rx, rg.ry);
+    _maskCx.save();
+    _maskCx.translate(rg.x, rg.y);
+    _maskCx.scale(rg.rx / R, rg.ry / R);
+    const g = _maskCx.createRadialGradient(0, 0, 0, 0, 0, R);
+    g.addColorStop(0, 'rgba(0,0,0,1)');
+    g.addColorStop(0.62, 'rgba(0,0,0,1)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    _maskCx.fillStyle = g;
+    _maskCx.beginPath(); _maskCx.arc(0, 0, R, 0, Math.PI * 2); _maskCx.fill();
+    _maskCx.restore();
+  }
+  // 差分画像を描いて、マスクで口/目の周りだけ切り抜く
+  _layerCx.setTransform(1, 0, 0, 1, 0, 0);
+  _layerCx.clearRect(0, 0, w, h);
+  _layerCx.globalCompositeOperation = 'source-over';
+  _layerCx.drawImage(layer, 0, 0, w, h);
+  _layerCx.globalCompositeOperation = 'destination-in';
+  _layerCx.drawImage(_maskCv, 0, 0);
+  _layerCx.globalCompositeOperation = 'source-over';
+  // ベースの上にクロスフェード
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(_layerCv, ox, oy, w, h);
+  ctx.globalAlpha = 1;
+}
+
 // 画像アバターの描画
 function renderFlat() {
   const cv = flatCanvas;
@@ -778,17 +821,26 @@ function renderFlat() {
 
   const hasMouthLayer = !!flatAvatar.mouthOpenSprite;
   const hasEyesLayer = !!flatAvatar.eyesClosedSprite;
+  const px = flatAvatar.px;
+  const d = flatAvatar.eyeDist || 40;
 
   // 差分フレームをクロスフェード（本物の絵で口・目を動かす）
-  if (hasEyesLayer) {
+  // ※ 口/目の周りだけに限定して合成する。全体で重ねると背景・輪郭のズレがゴーストになる。
+  if (hasEyesLayer && px) {
     // 目とじフレームは1枚なので両目まとめて。小さい値はノイズなので切り、しきい値超えでパッと閉じる
     const raw = Math.max(flatState.blinkL, flatState.blinkR);
-    const a = clamp((raw - 0.32) / 0.45, 0, 1);
-    if (a > 0.01) { ctx.globalAlpha = a; ctx.drawImage(flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height); ctx.globalAlpha = 1; }
+    const a = clamp((raw - 0.30) / 0.42, 0, 1);
+    drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
+      { x: px.le.x, y: px.le.y, rx: d * 0.50, ry: d * 0.42 },
+      { x: px.re.x, y: px.re.y, rx: d * 0.50, ry: d * 0.42 },
+    ], a);
   }
-  if (hasMouthLayer) {
-    const a = clamp((flatState.mouth - 0.08) / 0.7, 0, 1);
-    if (a > 0.01) { ctx.globalAlpha = a; ctx.drawImage(flatAvatar.mouthOpenSprite, ox, oy, s.width, s.height); ctx.globalAlpha = 1; }
+  if (hasMouthLayer && px) {
+    const a = clamp((flatState.mouth - 0.06) / 0.6, 0, 1);
+    drawMaskedLayer(ctx, flatAvatar.mouthOpenSprite, ox, oy, s.width, s.height, [
+      // 口は下に大きく開くので、口点より少し下を中心に縦長の領域
+      { x: px.m.x, y: px.m.y + d * 0.22, rx: d * 0.60, ry: d * 0.85 },
+    ], a);
   }
 
   // 差分画像が無い部位だけ、描き足しでフォールバック
