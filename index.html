@@ -220,7 +220,7 @@ const MP_WASM_URL    = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.1
 const MP_MODEL_URL   = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
 // ---------- バージョン ----------
-const APP_VERSION = '2026.06.24h'; // 表示用（キャッシュが新しいか一目で分かる）
+const APP_VERSION = '2026.06.24i'; // 表示用（キャッシュが新しいか一目で分かる）
 const DATA_VERSION = 4;            // これを上げると古い保存アバターを無視して内蔵ネコを読み直す
 
 // ---------- DOM ----------
@@ -1032,13 +1032,13 @@ function renderFlat() {
 
     // 目：差分画像があれば目の周りだけクロスフェード、無ければまぶたを描き足し（どちらも開閉量に比例）
     if (hasEyesLayer) {
-      // 本物の目とじ写真を目の周りだけ合成。瞬きは一瞬なので、しきい値で
-      // キビキビ切り替える（中間でダラっとフェードして二重に見えるのを防ぐ）。
+      // 本物の目とじ写真を「目玉のところだけ」ギュッと絞って合成。位置が正確なので
+      // 範囲を狭くできる＝顔の広い面が変わらず、目だけが閉じて見える。
       const raw = Math.max(flatState.blinkL, flatState.blinkR);
       const a = clamp((raw - 0.42) / 0.16, 0, 1);
       drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
-        { x: px.le.x, y: px.le.y, rx: d * 0.66, ry: d * 0.58 },
-        { x: px.re.x, y: px.re.y, rx: d * 0.66, ry: d * 0.58 },
+        { x: px.le.x, y: px.le.y, rx: d * 0.34, ry: d * 0.24 },
+        { x: px.re.x, y: px.re.y, rx: d * 0.34, ry: d * 0.24 },
       ], a);
     } else {
       // 差分画像なし：眼の上の毛を引き下げて閉じる（実際の毛で・追加素材不要）
