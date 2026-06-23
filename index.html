@@ -220,8 +220,8 @@ const MP_WASM_URL    = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.1
 const MP_MODEL_URL   = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
 // ---------- バージョン ----------
-const APP_VERSION = '2026.06.24g'; // 表示用（キャッシュが新しいか一目で分かる）
-const DATA_VERSION = 3;            // これを上げると古い保存アバターを無視して内蔵ネコを読み直す
+const APP_VERSION = '2026.06.24h'; // 表示用（キャッシュが新しいか一目で分かる）
+const DATA_VERSION = 4;            // これを上げると古い保存アバターを無視して内蔵ネコを読み直す
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
@@ -538,29 +538,44 @@ function bboxOfContent(ctx, w, h) {
   return { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
 }
 
-// 別撮りの目とじ写真を、ベースの猫に合わせて拡大縮小・位置合わせ（シルエットのbbox一致）。
-// 別フレーミングの写真でも猫の位置が揃うので、目の周りだけ差し替えれば自然な瞬きになる。
-async function buildAlignedFrame(buf, mime) {
+// 別撮りの目とじ写真を、ベースの猫に合わせて位置合わせ。
+// frameCalib（写真内の目2点）があれば「目を直接合わせる」相似変換で正確に。
+// なければシルエットのbbox一致でざっくり。
+async function buildAlignedFrame(buf, mime, frameCalib) {
   const base = flatAvatar.sprite;
   if (!base) return null;
   const W = base.width, H = base.height;
   const bmp = await createImageBitmap(new Blob([buf], { type: mime || 'image/png' }));
-
-  // フレーム側のbbox（背景=四隅、それ以外＝猫＋マット）
-  const fc = document.createElement('canvas'); fc.width = bmp.width; fc.height = bmp.height;
-  fc.getContext('2d').drawImage(bmp, 0, 0);
-  const fb = bboxOfContent(fc.getContext('2d'), bmp.width, bmp.height);
-  // ベース側のbbox（透過済みなのでalpha）
-  const bb = bboxOfAlpha(base.getContext('2d'), W, H);
-
-  const s = bb.h / Math.max(fb.h, 1);          // 高さ基準でスケール
   const out = document.createElement('canvas'); out.width = W; out.height = H;
   const oc = out.getContext('2d');
   oc.imageSmoothingQuality = 'high';
-  oc.translate(bb.x + bb.w / 2, bb.y + bb.h / 2);
-  oc.scale(s, s);
-  oc.translate(-(fb.x + fb.w / 2), -(fb.y + fb.h / 2));
-  oc.drawImage(bmp, 0, 0);
+
+  if (frameCalib && flatAvatar.px) {
+    // 目2点で相似変換（拡大縮小＋回転＋平行移動）→ 写真の両目がベースの両目に正確に乗る
+    const P1 = flatAvatar.px.le, P2 = flatAvatar.px.re;
+    const Q1 = { x: frameCalib.le.x * bmp.width, y: frameCalib.le.y * bmp.height };
+    const Q2 = { x: frameCalib.re.x * bmp.width, y: frameCalib.re.y * bmp.height };
+    const dP = { x: P2.x - P1.x, y: P2.y - P1.y };
+    const dQ = { x: Q2.x - Q1.x, y: Q2.y - Q1.y };
+    const scale = Math.hypot(dP.x, dP.y) / Math.max(Math.hypot(dQ.x, dQ.y), 1);
+    const ang = Math.atan2(dP.y, dP.x) - Math.atan2(dQ.y, dQ.x);
+    oc.translate(P1.x, P1.y);
+    oc.rotate(ang);
+    oc.scale(scale, scale);
+    oc.translate(-Q1.x, -Q1.y);
+    oc.drawImage(bmp, 0, 0);
+  } else {
+    // フォールバック：シルエットのbbox一致
+    const fc = document.createElement('canvas'); fc.width = bmp.width; fc.height = bmp.height;
+    fc.getContext('2d').drawImage(bmp, 0, 0);
+    const fb = bboxOfContent(fc.getContext('2d'), bmp.width, bmp.height);
+    const bb = bboxOfAlpha(base.getContext('2d'), W, H);
+    const s = bb.h / Math.max(fb.h, 1);
+    oc.translate(bb.x + bb.w / 2, bb.y + bb.h / 2);
+    oc.scale(s, s);
+    oc.translate(-(fb.x + fb.w / 2), -(fb.y + fb.h / 2));
+    oc.drawImage(bmp, 0, 0);
+  }
   return out;
 }
 
@@ -580,7 +595,7 @@ async function activateImage(record, { save = true } = {}) {
   if (record.mouthOpenBuf) { delete record.mouthOpenBuf; delete record.mouthOpenMime; }
   // 目とじ差分フレーム（任意）。口は差分不要でベース画像から変形する。
   flatAvatar.mouthOpenSprite = null;
-  flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildAlignedFrame(record.eyesClosedBuf, record.eyesClosedMime) : null;
+  flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildAlignedFrame(record.eyesClosedBuf, record.eyesClosedMime, record.eyesClosedCalib) : null;
   refreshLayerButtons();
 
   $('chkBgRemove').checked = record.bgRemove !== false;
@@ -1017,10 +1032,10 @@ function renderFlat() {
 
     // 目：差分画像があれば目の周りだけクロスフェード、無ければまぶたを描き足し（どちらも開閉量に比例）
     if (hasEyesLayer) {
-      // 本物の目とじ写真を目の周りだけクロスフェード。瞬きは速いのでフェードでも自然。
-      // マスクは目より少し大きめ＝継ぎ目が毛の中になり、多少の位置ズレも目立たない。
+      // 本物の目とじ写真を目の周りだけ合成。瞬きは一瞬なので、しきい値で
+      // キビキビ切り替える（中間でダラっとフェードして二重に見えるのを防ぐ）。
       const raw = Math.max(flatState.blinkL, flatState.blinkR);
-      const a = clamp((raw - 0.28) / 0.40, 0, 1);
+      const a = clamp((raw - 0.42) / 0.16, 0, 1);
       drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
         { x: px.le.x, y: px.le.y, rx: d * 0.66, ry: d * 0.58 },
         { x: px.re.x, y: px.re.y, rx: d * 0.66, ry: d * 0.58 },
@@ -1168,10 +1183,11 @@ async function loadCat() {
     kind: 'image', buf, mime: cat.mime || 'image/png',
     crop: null, calib: cat.calib, bgRemove: cat.bgRemove !== false,
   };
-  // 付属の目とじ写真も一緒に（本物写真でリアルな瞬き）
+  // 付属の目とじ写真も一緒に（本物写真でリアルな瞬き）。目2点で正確に位置合わせ
   if (cat.eyesClosedDataUrl) {
     rec.eyesClosedBuf = await (await fetch(cat.eyesClosedDataUrl)).arrayBuffer();
     rec.eyesClosedMime = cat.eyesClosedMime || 'image/jpeg';
+    rec.eyesClosedCalib = cat.eyesClosedCalib;
   }
   await activateImage(rec);
 }
