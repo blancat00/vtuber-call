@@ -501,6 +501,8 @@ async function activateImage(record, { save = true } = {}) {
   rebuildSprite(record.bgRemove !== false);
   computeFaceMetrics();
 
+  // 旧バージョンで保存された口あけ差分は不要（口は変形方式に移行）。残ってたら掃除する。
+  if (record.mouthOpenBuf) { delete record.mouthOpenBuf; delete record.mouthOpenMime; }
   // 目とじ差分フレーム（任意）。口は差分不要でベース画像から変形する。
   flatAvatar.mouthOpenSprite = null;
   flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildLayerSprite(record.eyesClosedBuf, record.eyesClosedMime, record) : null;
@@ -769,22 +771,27 @@ function drawJawDrop(ctx, base, ox, oy, w, h, m, d, openRaw) {
   lx.setTransform(1, 0, 0, 1, 0, 0);
   lx.clearRect(0, 0, w, h);
 
-  // 1) 口の中（キャビティ）。開くほど縦に伸びる楕円。
+  // 1) 口の中（キャビティ）。開くほど縦に伸びる楕円。フチをぼかして暗めに。
   const midY = (cavTop + cavBot) / 2;
+  lx.save();
+  lx.shadowColor = 'rgba(15,6,7,0.85)';
+  lx.shadowBlur = d * 0.09;          // フチを暗くぼかして毛に馴染ませる
   const g = lx.createLinearGradient(0, cavTop, 0, cavBot);
-  g.addColorStop(0, '#241011');     // 上（口蓋）は暗い
-  g.addColorStop(1, '#62322e');
+  g.addColorStop(0, '#160a0b');      // 上（口蓋）はかなり暗い
+  g.addColorStop(1, '#341c1b');
   lx.fillStyle = g;
   lx.beginPath();
-  lx.ellipse(m.x, midY, halfW, Math.max(drop / 2, 0.5), 0, 0, Math.PI * 2);
+  lx.ellipse(m.x, midY, halfW * 0.92, Math.max(drop / 2, 0.5), 0, 0, Math.PI * 2);
   lx.fill();
-  // 舌／下唇のピンク（下のほうにうっすら）
-  if (drop > d * 0.14) {
-    lx.fillStyle = 'rgba(206,128,124,0.85)';
+  lx.shadowBlur = 0;
+  // 舌（控えめ・小さめ・下のほう）。大きく開けたときだけ薄く。
+  if (drop > d * 0.20) {
+    lx.fillStyle = 'rgba(150,84,82,0.5)';
     lx.beginPath();
-    lx.ellipse(m.x, cavBot - drop * 0.22, halfW * 0.66, Math.min(drop * 0.30, d * 0.16), 0, 0, Math.PI * 2);
+    lx.ellipse(m.x, cavBot - drop * 0.26, halfW * 0.5, Math.min(drop * 0.22, d * 0.11), 0, 0, Math.PI * 2);
     lx.fill();
   }
+  lx.restore();
 
   // 2) 下あごスライス：ベースの上唇から下を、drop分だけ下にずらして描く
   const sliceH = h - yLip;
@@ -806,6 +813,46 @@ function drawJawDrop(ctx, base, ox, oy, w, h, m, d, openRaw) {
   lx.globalCompositeOperation = 'source-over';
 
   // ベースの上にそのまま重ねる（フェードではなく形の置き換え）
+  ctx.drawImage(_layerCv, ox, oy, w, h);
+}
+
+// 目を閉じる：眼の上の毛を閉じ量に比例して下へ引き下げ、瞳を覆う（本物の毛のテクスチャでまぶた風）。
+function drawEyeClose(ctx, base, ox, oy, w, h, e, eyeR, closedRaw) {
+  const closed = clamp((closedRaw - 0.06) / 0.88, 0, 1);
+  if (closed <= 0.02) return;
+  ensureOffscreen(w, h);
+  const lx = _layerCx, mk = _maskCx;
+  const ex = e.x, ey = e.y;
+  const halfW = eyeR * 1.5;
+  const drop = closed * (eyeR * 1.9);  // 上まぶたが降りてくる量
+  const browTop = ey - eyeR * 2.3;     // まぶたに使う上の毛の帯
+  const stripH = eyeR * 2.5;
+
+  lx.setTransform(1, 0, 0, 1, 0, 0);
+  lx.clearRect(0, 0, w, h);
+  // 眼の上の毛を下へずらして瞳を覆う
+  lx.drawImage(base, ex - halfW, browTop, halfW * 2, stripH, ex - halfW, browTop + drop, halfW * 2, stripH);
+  // 合わせ目の細いライン（ほぼ閉じたとき）
+  if (closed > 0.45) {
+    const ly = browTop + drop + stripH - eyeR * 0.35;
+    lx.strokeStyle = `rgba(60,48,44,${0.45 * (closed - 0.45) / 0.55})`;
+    lx.lineWidth = Math.max(1, eyeR * 0.11);
+    lx.beginPath();
+    lx.moveTo(ex - eyeR * 1.0, ly);
+    lx.quadraticCurveTo(ex, ly + eyeR * 0.2, ex + eyeR * 1.0, ly);
+    lx.stroke();
+  }
+  // 眼の領域だけにマスク（楕円・ソフト）
+  mk.setTransform(1, 0, 0, 1, 0, 0);
+  mk.clearRect(0, 0, w, h);
+  const ry = eyeR * 1.35, R = Math.max(halfW, ry);
+  mk.save(); mk.translate(ex, ey); mk.scale(halfW / R, ry / R);
+  const g = mk.createRadialGradient(0, 0, 0, 0, 0, R);
+  g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.6, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  mk.fillStyle = g; mk.beginPath(); mk.arc(0, 0, R, 0, Math.PI * 2); mk.fill(); mk.restore();
+  lx.globalCompositeOperation = 'destination-in';
+  lx.drawImage(_maskCv, 0, 0);
+  lx.globalCompositeOperation = 'source-over';
   ctx.drawImage(_layerCv, ox, oy, w, h);
 }
 
@@ -860,6 +907,7 @@ function renderFlat() {
   // なめらかに追従
   for (const k in flatState) flatState[k] = lerp(flatState[k], flatTarget[k], 0.28);
   if (__freezeMouth != null) { flatState.mouth = __freezeMouth; flatTarget.mouth = __freezeMouth; }
+  if (__freezeBlink != null) { flatState.blinkL = flatState.blinkR = __freezeBlink; flatTarget.blinkL = flatTarget.blinkR = __freezeBlink; }
 
   const view = settings.flatView || { zoom: 1, ox: 0, oy: 0 };
   const breath = 1 + 0.006 * Math.sin(clock.elapsedTime * 2 * Math.PI / 4.2);
@@ -894,26 +942,42 @@ function renderFlat() {
         { x: px.re.x, y: px.re.y, rx: d * 0.50, ry: d * 0.42 },
       ], a);
     } else {
-      drawLid(ctx, px.le.x + ox, px.le.y + oy, flatAvatar.eyeR, flatState.blinkL, flatAvatar.lidColorL);
-      drawLid(ctx, px.re.x + ox, px.re.y + oy, flatAvatar.eyeR, flatState.blinkR, flatAvatar.lidColorR);
+      // 差分画像なし：眼の上の毛を引き下げて閉じる（実際の毛で・追加素材不要）
+      drawEyeClose(ctx, s, ox, oy, s.width, s.height, px.le, flatAvatar.eyeR, flatState.blinkL);
+      drawEyeClose(ctx, s, ox, oy, s.width, s.height, px.re, flatAvatar.eyeR, flatState.blinkR);
     }
   }
   ctx.restore();
 }
 
+// まぶた（上から降りてくる毛色の覆い＋合わせ目の細い線）。フチをぼかして毛に馴染ませる。
 function drawLid(ctx, x, y, r, closed, color) {
-  if (closed < 0.08) return;
+  const c = clamp(closed, 0, 1);
+  if (c < 0.06) return;
+  const eyeTop = y - r * 1.05;
+  const lidBottom = eyeTop + (r * 2.15) * c; // 閉じるほど下まで降りる
+  ctx.save();
   ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = r * 0.35; // 下縁をぼかして毛になじませる
   ctx.beginPath();
-  ctx.ellipse(x, y, r * 1.25, Math.max(r * closed * 1.1, 0.5), 0, 0, Math.PI * 2);
+  ctx.moveTo(x - r * 1.35, eyeTop - r * 0.5);
+  ctx.lineTo(x + r * 1.35, eyeTop - r * 0.5);
+  ctx.lineTo(x + r * 1.35, lidBottom - r * 0.2);
+  ctx.quadraticCurveTo(x, lidBottom + r * 0.3, x - r * 1.35, lidBottom - r * 0.2);
+  ctx.closePath();
   ctx.fill();
-  if (closed > 0.75) { // 閉じ目のかわいい線
-    ctx.strokeStyle = 'rgba(70,55,50,0.6)';
-    ctx.lineWidth = Math.max(1, r * 0.14);
+  ctx.shadowBlur = 0;
+  // 合わせ目の細いライン（ほぼ閉じたとき）
+  if (c > 0.55) {
+    ctx.strokeStyle = `rgba(58,46,42,${0.4 * (c - 0.55) / 0.45})`;
+    ctx.lineWidth = Math.max(1, r * 0.09);
     ctx.beginPath();
-    ctx.arc(x, y - r * 0.35, r * 0.85, 0.2 * Math.PI, 0.8 * Math.PI);
+    ctx.moveTo(x - r * 1.05, lidBottom - r * 0.12);
+    ctx.quadraticCurveTo(x, lidBottom + r * 0.14, x + r * 1.05, lidBottom - r * 0.12);
     ctx.stroke();
   }
+  ctx.restore();
 }
 
 // 描き足しの口（差分画像が無いとき用のフォールバック。控えめに）
@@ -1243,9 +1307,10 @@ function loop() {
 setInterval(() => { if (document.hidden) tick(); }, 33);
 
 // 動作確認用フック
-let __freezeMouth = null; // テスト用：口の開きを固定
+let __freezeMouth = null, __freezeBlink = null; // テスト用：口・目の開きを固定
 window.__vt = { applyFace, activateImage, getMode: () => mode,
-  freezeMouth: (v) => { __freezeMouth = v; } };
+  freezeMouth: (v) => { __freezeMouth = v; },
+  freezeBlink: (v) => { __freezeBlink = v; } };
 
 // ---------- パネル表示切替 ----------
 function applyPip() {
