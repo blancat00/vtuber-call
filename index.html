@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
 <title>アバター通話 — Face Tracking VTuber</title>
 <style>
   :root { color-scheme: dark; }
@@ -104,7 +107,7 @@
 
 <div id="panel">
   <button id="panelToggle" title="パネルを開閉">▲</button>
-  <h1>アバター通話<small>face tracking vtuber</small></h1>
+  <h1>アバター通話<small id="ver">v?</small></h1>
   <div id="status">初期化中…</div>
 
   <div id="panelBody">
@@ -169,6 +172,9 @@
     </ol>
   </details>
 
+  <div class="row" style="margin-top:6px">
+    <button id="btnReset" class="sub">リセット（保存データ全消去）</button>
+  </div>
   <div class="hint">Hキー：パネル表示切替　／　VRMでも画像（PNG/JPG）でもドラッグ&ドロップで読み込めるで。画像はホイールで拡大縮小・ドラッグで位置調整や。</div>
   </div><!-- /panelBody -->
 </div>
@@ -213,6 +219,10 @@ const SAMPLE_VRM_URL = 'https://cdn.jsdelivr.net/gh/pixiv/three-vrm@dev/packages
 const MP_WASM_URL    = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
 const MP_MODEL_URL   = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
+// ---------- バージョン ----------
+const APP_VERSION = '2026.06.24g'; // 表示用（キャッシュが新しいか一目で分かる）
+const DATA_VERSION = 3;            // これを上げると古い保存アバターを無視して内蔵ネコを読み直す
+
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const video = $('cam');
@@ -221,6 +231,16 @@ const panel = $('panel');
 const params = new URLSearchParams(location.search);
 const clamp = THREE.MathUtils.clamp;
 const lerp = THREE.MathUtils.lerp;
+
+$('ver').textContent = 'v' + APP_VERSION;
+
+// リセット（保存データ全消去）— キャッシュやデータが古いとき用
+$('btnReset').addEventListener('click', () => {
+  if (!confirm('保存データを全部消して最初からにする？')) return;
+  try { indexedDB.deleteDatabase('vtuber-call'); } catch {}
+  try { localStorage.removeItem('vtuber-call-settings'); } catch {}
+  location.reload();
+});
 
 function setStatus(text, type = '') {
   statusEl.textContent = text;
@@ -298,6 +318,7 @@ function openDB() {
 }
 async function idbPut(record) {
   try {
+    record.dv = DATA_VERSION; // データ世代を刻む（古い保存を見分ける）
     const db = await openDB();
     db.transaction('vrm', 'readwrite').objectStore('vrm').put(record, 'last');
   } catch (e) { console.warn('アバター保存失敗', e); }
@@ -1138,26 +1159,25 @@ async function loadAnyFile(f) {
   }
 }
 
-$('btnCat').addEventListener('click', async () => {
-  try {
-    if (!window.CAT_AVATAR) { setStatus('ネコ素材（cat_assets.js）が見つからへん', 'err'); return; }
-    setStatus('ネコ準備中…');
-    const cat = window.CAT_AVATAR;
-    const buf = await (await fetch(cat.dataUrl)).arrayBuffer();
-    const rec = {
-      kind: 'image', buf, mime: cat.mime || 'image/png',
-      crop: null, calib: cat.calib, bgRemove: cat.bgRemove !== false,
-    };
-    // 付属の目とじ写真も一緒に（本物写真でリアルな瞬き）
-    if (cat.eyesClosedDataUrl) {
-      rec.eyesClosedBuf = await (await fetch(cat.eyesClosedDataUrl)).arrayBuffer();
-      rec.eyesClosedMime = cat.eyesClosedMime || 'image/jpeg';
-    }
-    await activateImage(rec);
-  } catch (err) {
-    console.error(err);
-    setStatus('ネコの読み込みに失敗したわ…', 'err');
+async function loadCat() {
+  if (!window.CAT_AVATAR) { setStatus('ネコ素材（cat_assets.js）が見つからへん', 'err'); return; }
+  setStatus('ネコ準備中…');
+  const cat = window.CAT_AVATAR;
+  const buf = await (await fetch(cat.dataUrl)).arrayBuffer();
+  const rec = {
+    kind: 'image', buf, mime: cat.mime || 'image/png',
+    crop: null, calib: cat.calib, bgRemove: cat.bgRemove !== false,
+  };
+  // 付属の目とじ写真も一緒に（本物写真でリアルな瞬き）
+  if (cat.eyesClosedDataUrl) {
+    rec.eyesClosedBuf = await (await fetch(cat.eyesClosedDataUrl)).arrayBuffer();
+    rec.eyesClosedMime = cat.eyesClosedMime || 'image/jpeg';
   }
+  await activateImage(rec);
+}
+$('btnCat').addEventListener('click', async () => {
+  try { await loadCat(); }
+  catch (err) { console.error(err); setStatus('ネコの読み込みに失敗したわ…', 'err'); }
 });
 
 $('btnSample').addEventListener('click', async () => {
@@ -1422,10 +1442,12 @@ async function main() {
     try {
       if (params.get('vrm')) { await loadVRMFromURL(params.get('vrm')); return; }
       const saved = await idbGet();
-      if (saved instanceof ArrayBuffer) { await loadVRMFromBuffer(saved); }       // 旧形式
-      else if (saved?.kind === 'vrm') { await loadVRMFromBuffer(saved.buf); }
-      else if (saved?.kind === 'image') { await activateImage(saved, { save: false }); }
-      else setStatus('アバター未読込 — 画像かVRMをドロップしてな（3Dサンプルもあるで）', 'warn');
+      // データ世代が古い（or 無い）保存は無視して、内蔵ネコを読み直す（古いデータ対策）
+      const fresh = saved && saved.dv === DATA_VERSION;
+      if (fresh && saved.kind === 'vrm') { await loadVRMFromBuffer(saved.buf); }
+      else if (fresh && saved.kind === 'image') { await activateImage(saved, { save: false }); }
+      else if (window.CAT_AVATAR) { await loadCat(); }  // 既定で内蔵ネコを表示
+      else setStatus('アバター未読込 — 画像かVRMをドロップしてな', 'warn');
     } catch (e) {
       console.error(e);
       setStatus('アバターの復元に失敗したわ', 'err');
