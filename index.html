@@ -489,6 +489,60 @@ async function buildLayerSprite(buf, mime, record) {
   return c;
 }
 
+// 不透明部分（猫）のバウンディングボックス
+function bboxOfAlpha(ctx, w, h) {
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let x0 = w, y0 = h, x1 = 0, y1 = 0, found = false;
+  const step = Math.max(1, Math.floor(Math.min(w, h) / 500));
+  for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+    if (d[(y * w + x) * 4 + 3] > 25) { found = true; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  }
+  if (!found) return { x: 0, y: 0, w, h };
+  return { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+}
+// 四隅を背景色とみなし、それと違う部分（猫＋マット）のバウンディングボックス
+function bboxOfContent(ctx, w, h) {
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const cs = [[2, 2], [w - 3, 2], [2, h - 3], [w - 3, h - 3]];
+  const bg = [0, 1, 2].map((k) => cs.map(([x, y]) => d[(y * w + x) * 4 + k]).sort((a, b) => a - b)[1]);
+  let x0 = w, y0 = h, x1 = 0, y1 = 0, found = false;
+  const step = Math.max(1, Math.floor(Math.min(w, h) / 500));
+  for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+    const i = (y * w + x) * 4;
+    if (Math.hypot(d[i] - bg[0], d[i + 1] - bg[1], d[i + 2] - bg[2]) > 24) {
+      found = true; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  }
+  if (!found) return { x: 0, y: 0, w, h };
+  return { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+}
+
+// 別撮りの目とじ写真を、ベースの猫に合わせて拡大縮小・位置合わせ（シルエットのbbox一致）。
+// 別フレーミングの写真でも猫の位置が揃うので、目の周りだけ差し替えれば自然な瞬きになる。
+async function buildAlignedFrame(buf, mime) {
+  const base = flatAvatar.sprite;
+  if (!base) return null;
+  const W = base.width, H = base.height;
+  const bmp = await createImageBitmap(new Blob([buf], { type: mime || 'image/png' }));
+
+  // フレーム側のbbox（背景=四隅、それ以外＝猫＋マット）
+  const fc = document.createElement('canvas'); fc.width = bmp.width; fc.height = bmp.height;
+  fc.getContext('2d').drawImage(bmp, 0, 0);
+  const fb = bboxOfContent(fc.getContext('2d'), bmp.width, bmp.height);
+  // ベース側のbbox（透過済みなのでalpha）
+  const bb = bboxOfAlpha(base.getContext('2d'), W, H);
+
+  const s = bb.h / Math.max(fb.h, 1);          // 高さ基準でスケール
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const oc = out.getContext('2d');
+  oc.imageSmoothingQuality = 'high';
+  oc.translate(bb.x + bb.w / 2, bb.y + bb.h / 2);
+  oc.scale(s, s);
+  oc.translate(-(fb.x + fb.w / 2), -(fb.y + fb.h / 2));
+  oc.drawImage(bmp, 0, 0);
+  return out;
+}
+
 async function activateImage(record, { save = true } = {}) {
   const bmp = await createImageBitmap(new Blob([record.buf], { type: record.mime || 'image/png' }));
   record.origW = bmp.width; record.origH = bmp.height;
@@ -505,7 +559,7 @@ async function activateImage(record, { save = true } = {}) {
   if (record.mouthOpenBuf) { delete record.mouthOpenBuf; delete record.mouthOpenMime; }
   // 目とじ差分フレーム（任意）。口は差分不要でベース画像から変形する。
   flatAvatar.mouthOpenSprite = null;
-  flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildLayerSprite(record.eyesClosedBuf, record.eyesClosedMime, record) : null;
+  flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildAlignedFrame(record.eyesClosedBuf, record.eyesClosedMime) : null;
   refreshLayerButtons();
 
   $('chkBgRemove').checked = record.bgRemove !== false;
@@ -545,10 +599,10 @@ $('layerInput').addEventListener('change', async (e) => {
   try {
     const buf = await f.arrayBuffer();
     currentRecord.eyesClosedBuf = buf; currentRecord.eyesClosedMime = f.type;
-    flatAvatar.eyesClosedSprite = await buildLayerSprite(buf, f.type, currentRecord);
+    flatAvatar.eyesClosedSprite = await buildAlignedFrame(buf, f.type);
     refreshLayerButtons();
     idbPut(currentRecord);
-    setStatus('目とじ画像を設定したで！まばたきしてみて');
+    setStatus('目とじ画像を設定したで！自動で位置合わせした — まばたきしてみて');
   } catch (err) {
     console.error(err);
     setStatus('差分画像の読み込みに失敗したわ…', 'err');
@@ -793,21 +847,28 @@ function drawJawDrop(ctx, base, ox, oy, w, h, m, d, openRaw) {
   }
   lx.restore();
 
-  // 2) 下あごスライス：ベースの上唇から下を、drop分だけ下にずらして描く
-  const sliceH = h - yLip;
+  // 2) あごスライス：上唇〜あごの「狭い帯だけ」をdrop分ずらす（胸・体は動かさない）
+  const chinH = d * 0.95;            // 動かすあご帯の高さ（これ以上下＝胸は触らない）
   lx.imageSmoothingEnabled = true;
-  lx.drawImage(base, x0, yLip, muzzleW, sliceH, x0, yLip + drop, muzzleW, sliceH);
+  lx.drawImage(base, x0, yLip, muzzleW, chinH, x0, yLip + drop, muzzleW, chinH);
 
-  // 3) 横方向フェザーのマスクで口元バンドだけ残す（頬や髭の境目を馴染ませる）
+  // 3) 口元（あご）の周りだけ楕円ソフトマスク（横も縦も限定＝体に影響させない）
   mx2.setTransform(1, 0, 0, 1, 0, 0);
   mx2.clearRect(0, 0, w, h);
-  const mg = mx2.createLinearGradient(x0, 0, x0 + muzzleW, 0);
-  mg.addColorStop(0, 'rgba(0,0,0,0)');
-  mg.addColorStop(0.20, 'rgba(0,0,0,1)');
-  mg.addColorStop(0.80, 'rgba(0,0,0,1)');
+  const cyMask = yLip + (chinH + drop) * 0.5;
+  const rxMask = muzzleW * 0.46;
+  const ryMask = (chinH + drop) * 0.5 + d * 0.05;
+  const Rm = Math.max(rxMask, ryMask);
+  mx2.save();
+  mx2.translate(m.x, cyMask);
+  mx2.scale(rxMask / Rm, ryMask / Rm);
+  const mg = mx2.createRadialGradient(0, 0, 0, 0, 0, Rm);
+  mg.addColorStop(0, 'rgba(0,0,0,1)');
+  mg.addColorStop(0.62, 'rgba(0,0,0,1)');
   mg.addColorStop(1, 'rgba(0,0,0,0)');
   mx2.fillStyle = mg;
-  mx2.fillRect(x0, yLip, muzzleW, h - yLip);
+  mx2.beginPath(); mx2.arc(0, 0, Rm, 0, Math.PI * 2); mx2.fill();
+  mx2.restore();
   lx.globalCompositeOperation = 'destination-in';
   lx.drawImage(_maskCv, 0, 0);
   lx.globalCompositeOperation = 'source-over';
@@ -935,11 +996,13 @@ function renderFlat() {
 
     // 目：差分画像があれば目の周りだけクロスフェード、無ければまぶたを描き足し（どちらも開閉量に比例）
     if (hasEyesLayer) {
+      // 本物の目とじ写真を目の周りだけクロスフェード。瞬きは速いのでフェードでも自然。
+      // マスクは目より少し大きめ＝継ぎ目が毛の中になり、多少の位置ズレも目立たない。
       const raw = Math.max(flatState.blinkL, flatState.blinkR);
-      const a = clamp((raw - 0.30) / 0.42, 0, 1);
+      const a = clamp((raw - 0.28) / 0.40, 0, 1);
       drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
-        { x: px.le.x, y: px.le.y, rx: d * 0.50, ry: d * 0.42 },
-        { x: px.re.x, y: px.re.y, rx: d * 0.50, ry: d * 0.42 },
+        { x: px.le.x, y: px.le.y, rx: d * 0.66, ry: d * 0.58 },
+        { x: px.re.x, y: px.re.y, rx: d * 0.66, ry: d * 0.58 },
       ], a);
     } else {
       // 差分画像なし：眼の上の毛を引き下げて閉じる（実際の毛で・追加素材不要）
