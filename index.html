@@ -1144,10 +1144,16 @@ $('btnCat').addEventListener('click', async () => {
     setStatus('ネコ準備中…');
     const cat = window.CAT_AVATAR;
     const buf = await (await fetch(cat.dataUrl)).arrayBuffer();
-    await activateImage({
+    const rec = {
       kind: 'image', buf, mime: cat.mime || 'image/png',
       crop: null, calib: cat.calib, bgRemove: cat.bgRemove !== false,
-    });
+    };
+    // 付属の目とじ写真も一緒に（本物写真でリアルな瞬き）
+    if (cat.eyesClosedDataUrl) {
+      rec.eyesClosedBuf = await (await fetch(cat.eyesClosedDataUrl)).arrayBuffer();
+      rec.eyesClosedMime = cat.eyesClosedMime || 'image/jpeg';
+    }
+    await activateImage(rec);
   } catch (err) {
     console.error(err);
     setStatus('ネコの読み込みに失敗したわ…', 'err');
