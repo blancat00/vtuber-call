@@ -220,8 +220,8 @@ const MP_WASM_URL    = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.1
 const MP_MODEL_URL   = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
 // ---------- バージョン ----------
-const APP_VERSION = '2026.06.24i'; // 表示用（キャッシュが新しいか一目で分かる）
-const DATA_VERSION = 4;            // これを上げると古い保存アバターを無視して内蔵ネコを読み直す
+const APP_VERSION = '2026.06.24j'; // 表示用（キャッシュが新しいか一目で分かる）
+const DATA_VERSION = 5;            // これを上げると古い保存アバターを無視して内蔵ネコを読み直す
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
@@ -396,6 +396,7 @@ const flatAvatar = {
   sprite: null,  // 表示用（透過処理後）
   mouthOpenSprite: null,  // 差分: 口あけフレーム
   eyesClosedSprite: null, // 差分: 目とじフレーム
+  mouthFrameSprites: [],  // 実写の口開度フレーム群 [{t, sprite}, ...]（あれば変形方式の代わりに使う）
   calib: null,   // {le,re,m} 画像内の正規化座標
   eyeR: 10, mouthR: 12,
   lidColorL: '#e8e4de', lidColorR: '#e8e4de',
@@ -596,6 +597,15 @@ async function activateImage(record, { save = true } = {}) {
   // 目とじ差分フレーム（任意）。口は差分不要でベース画像から変形する。
   flatAvatar.mouthOpenSprite = null;
   flatAvatar.eyesClosedSprite = record.eyesClosedBuf ? await buildAlignedFrame(record.eyesClosedBuf, record.eyesClosedMime, record.eyesClosedCalib) : null;
+  // 実写の口開度フレーム群（あれば）。同じ構図の写真なので目2点の相似変換でぴったり揃う。
+  flatAvatar.mouthFrameSprites = [];
+  if (record.mouthFrames && record.mouthFrames.length) {
+    for (const f of record.mouthFrames) {
+      const sprite = await buildAlignedFrame(f.buf, f.mime, f.calib);
+      if (sprite) flatAvatar.mouthFrameSprites.push({ t: f.t, sprite });
+    }
+    flatAvatar.mouthFrameSprites.sort((a, b) => a.t - b.t);
+  }
   refreshLayerButtons();
 
   $('chkBgRemove').checked = record.bgRemove !== false;
@@ -840,6 +850,24 @@ function ensureOffscreen(w, h) {
   }
 }
 
+// 口の開度に応じて実写フレーム（同一構図・複数枚）を2枚ブレンドして描く。
+// パペット変形やのうて本物の写真がそのまま動く＝目と口の毛流れが常に自然。
+function drawMouthFrameBlend(ctx, ox, oy, w, h, frames, openRaw) {
+  const v = clamp((openRaw - 0.05) / 0.82, 0, 1); // 待機中の微振動を無視し、開きすぎで頭打ちにしない
+  let lo = frames[0], hi = frames[frames.length - 1];
+  for (let i = 0; i < frames.length - 1; i++) {
+    if (v >= frames[i].t && v <= frames[i + 1].t) { lo = frames[i]; hi = frames[i + 1]; break; }
+  }
+  const span = Math.max(hi.t - lo.t, 0.0001);
+  const frac = clamp((v - lo.t) / span, 0, 1);
+  ctx.drawImage(lo.sprite, ox, oy, w, h);
+  if (frac > 0.001) {
+    ctx.globalAlpha = frac;
+    ctx.drawImage(hi.sprite, ox, oy, w, h);
+    ctx.globalAlpha = 1;
+  }
+}
+
 // 口を「開けた量だけ」実際に開く（パペット方式）。
 // ベース画像の上唇から下を、開けた量に比例して下にずらし、空いた隙間に口の中を描く。
 // → フェードではなく、口の開き具合とリアルタイムに連動して猫の口が開く。
@@ -1020,15 +1048,23 @@ function renderFlat() {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   const ox = -s.width / 2, oy = -s.height / 2;
-  ctx.drawImage(s, ox, oy, s.width, s.height);
+  const hasMouthFrames = flatAvatar.mouthFrameSprites.length > 0;
+  if (hasMouthFrames) {
+    // 口：実写フレームを開度でブレンド（本物の写真がそのまま動く）
+    drawMouthFrameBlend(ctx, ox, oy, s.width, s.height, flatAvatar.mouthFrameSprites, flatState.mouth);
+  } else {
+    ctx.drawImage(s, ox, oy, s.width, s.height);
+  }
 
   const hasEyesLayer = !!flatAvatar.eyesClosedSprite;
   const px = flatAvatar.px;
   const d = flatAvatar.eyeDist || 40;
 
   if (px) {
-    // 口：開けた量だけベース画像の下あごを実際に下げて開く（フェードやない）
-    drawJawDrop(ctx, s, ox, oy, s.width, s.height, px.m, d, flatState.mouth);
+    if (!hasMouthFrames) {
+      // 口：実写フレームが無い場合のみ、あご変形（パペット方式）で代用
+      drawJawDrop(ctx, s, ox, oy, s.width, s.height, px.m, d, flatState.mouth);
+    }
 
     // 目：差分画像があれば目の周りだけクロスフェード、無ければまぶたを描き足し（どちらも開閉量に比例）
     if (hasEyesLayer) {
@@ -1036,9 +1072,13 @@ function renderFlat() {
       // 範囲を狭くできる＝顔の広い面が変わらず、目だけが閉じて見える。
       const raw = Math.max(flatState.blinkL, flatState.blinkR);
       const a = clamp((raw - 0.42) / 0.16, 0, 1);
+      // 実写連動セット（mouthFrames）は口が開くほど目も大きく開く写真なので、
+      // 目とじマスクを広めに取って開いた瞳がフチから透けないようにする
+      const eyeMaskRx = hasMouthFrames ? d * 0.62 : d * 0.34;
+      const eyeMaskRy = hasMouthFrames ? d * 0.62 : d * 0.24;
       drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
-        { x: px.le.x, y: px.le.y, rx: d * 0.34, ry: d * 0.24 },
-        { x: px.re.x, y: px.re.y, rx: d * 0.34, ry: d * 0.24 },
+        { x: px.le.x, y: px.le.y, rx: eyeMaskRx, ry: eyeMaskRy },
+        { x: px.re.x, y: px.re.y, rx: eyeMaskRx, ry: eyeMaskRy },
       ], a);
     } else {
       // 差分画像なし：眼の上の毛を引き下げて閉じる（実際の毛で・追加素材不要）
@@ -1188,6 +1228,14 @@ async function loadCat() {
     rec.eyesClosedBuf = await (await fetch(cat.eyesClosedDataUrl)).arrayBuffer();
     rec.eyesClosedMime = cat.eyesClosedMime || 'image/jpeg';
     rec.eyesClosedCalib = cat.eyesClosedCalib;
+  }
+  // 付属の口開度フレーム群も一緒に（本物写真で口と目が自然に連動して開閉）
+  if (cat.mouthFrames && cat.mouthFrames.length) {
+    rec.mouthFrames = [];
+    for (const f of cat.mouthFrames) {
+      const fb = await (await fetch(f.dataUrl)).arrayBuffer();
+      rec.mouthFrames.push({ t: f.t, buf: fb, mime: cat.mouthFramesMime || cat.mime || 'image/jpeg', calib: f.calib || cat.calib });
+    }
   }
   await activateImage(rec);
 }
