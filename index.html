@@ -865,24 +865,6 @@ function ensureOffscreen(w, h) {
   }
 }
 
-// 口の開度に応じて実写フレーム（同一構図・複数枚）を2枚ブレンドして描く。
-// パペット変形やのうて本物の写真がそのまま動く＝目と口の毛流れが常に自然。
-function drawMouthFrameBlend(ctx, ox, oy, w, h, frames, openRaw) {
-  const v = clamp((openRaw - 0.05) / 0.82, 0, 1); // 待機中の微振動を無視し、開きすぎで頭打ちにしない
-  let lo = frames[0], hi = frames[frames.length - 1];
-  for (let i = 0; i < frames.length - 1; i++) {
-    if (v >= frames[i].t && v <= frames[i + 1].t) { lo = frames[i]; hi = frames[i + 1]; break; }
-  }
-  const span = Math.max(hi.t - lo.t, 0.0001);
-  const frac = clamp((v - lo.t) / span, 0, 1);
-  ctx.drawImage(lo.sprite, ox, oy, w, h);
-  if (frac > 0.001) {
-    ctx.globalAlpha = frac;
-    ctx.drawImage(hi.sprite, ox, oy, w, h);
-    ctx.globalAlpha = 1;
-  }
-}
-
 // 口を「開けた量だけ」実際に開く（パペット方式）。
 // ベース画像の上唇から下を、開けた量に比例して下にずらし、空いた隙間に口の中を描く。
 // → フェードではなく、口の開き具合とリアルタイムに連動して猫の口が開く。
@@ -1044,7 +1026,7 @@ function drawMaskedFrameBlend(ctx, frames, v, ox, oy, w, h, regions) {
     _maskCx.scale(rg.rx / R, rg.ry / R);
     const g = _maskCx.createRadialGradient(0, 0, 0, 0, 0, R);
     g.addColorStop(0, 'rgba(0,0,0,1)');
-    g.addColorStop(0.62, 'rgba(0,0,0,1)');
+    g.addColorStop(0.4, 'rgba(0,0,0,1)');
     g.addColorStop(1, 'rgba(0,0,0,0)');
     _maskCx.fillStyle = g;
     _maskCx.beginPath(); _maskCx.arc(0, 0, R, 0, Math.PI * 2); _maskCx.fill();
@@ -1105,19 +1087,24 @@ function renderFlat() {
   ctx.imageSmoothingQuality = 'high';
   const ox = -s.width / 2, oy = -s.height / 2;
   const hasMouthFrames = flatAvatar.mouthFrameSprites.length > 0;
-  if (hasMouthFrames) {
-    // 口：実写フレームを開度でブレンド（本物の写真がそのまま動く）
-    drawMouthFrameBlend(ctx, ox, oy, s.width, s.height, flatAvatar.mouthFrameSprites, flatState.mouth);
-  } else {
-    ctx.drawImage(s, ox, oy, s.width, s.height);
-  }
+  // ベースは常に同じ1枚（待機顔）。口・目はそれぞれ別マスクで局所的に上書きするので、
+  // ベース自体を口の開度でブレンドすると「マスクの外と中で地肌が変わって段差に見える」
+  // 問題が起きる（特に目のマスクが、口開度で変わるベースの目とズレて二重に見えていた）。
+  ctx.drawImage(s, ox, oy, s.width, s.height);
 
   const hasEyesLayer = !!flatAvatar.eyesClosedSprite;
   const px = flatAvatar.px;
   const d = flatAvatar.eyeDist || 40;
 
   if (px) {
-    if (!hasMouthFrames) {
+    if (hasMouthFrames) {
+      // 口：実写フレームを開度でブレンドし、口元だけのマスクで上書き（体・目には影響させない）
+      // 待機中の微振動を無視し、開きすぎで頭打ちにしない（drawMouthFrameBlendと同じ補正）
+      const mouthV = clamp((flatState.mouth - 0.05) / 0.82, 0, 1);
+      drawMaskedFrameBlend(ctx, flatAvatar.mouthFrameSprites, mouthV, ox, oy, s.width, s.height, [
+        { x: px.m.x, y: px.m.y + d * 0.25, rx: d * 0.95, ry: d * 1.05 },
+      ]);
+    } else {
       // 口：実写フレームが無い場合のみ、あご変形（パペット方式）で代用
       drawJawDrop(ctx, s, ox, oy, s.width, s.height, px.m, d, flatState.mouth);
     }
@@ -1130,9 +1117,10 @@ function renderFlat() {
       // 0〜100%の目フレームから1枚を選ぶ。ベースの口ブレンドの目を完全に上書きするので
       // 2枚の目が透けて二重に見える問題が起きない。
       const eyeOpen = 1 - clamp(Math.max(flatState.blinkL, flatState.blinkR), 0, 1);
+      // まぶたの皺がマスクの境目で切れて段差に見えないよう、十分大きく＋ソフトに
       drawMaskedFrameBlend(ctx, flatAvatar.eyeFrameSprites, eyeOpen, ox, oy, s.width, s.height, [
-        { x: px.le.x, y: px.le.y, rx: d * 0.5, ry: d * 0.5 },
-        { x: px.re.x, y: px.re.y, rx: d * 0.5, ry: d * 0.5 },
+        { x: px.le.x, y: px.le.y, rx: d * 0.62, ry: d * 0.55 },
+        { x: px.re.x, y: px.re.y, rx: d * 0.62, ry: d * 0.55 },
       ]);
     } else if (hasEyesLayer) {
       // 本物の目とじ写真を「目玉のところだけ」ギュッと絞って合成。位置が正確なので
