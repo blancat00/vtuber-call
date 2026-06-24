@@ -397,6 +397,7 @@ const flatAvatar = {
   mouthOpenSprite: null,  // 差分: 口あけフレーム
   eyesClosedSprite: null, // 差分: 目とじフレーム
   mouthFrameSprites: [],  // 実写の口開度フレーム群 [{t, sprite}, ...]（あれば変形方式の代わりに使う）
+  eyeFrameSprites: [],    // 目専用フレーム群 [{t, sprite}, ...]（まばたき量で1枚だけ鮮明に差し替える）
   calib: null,   // {le,re,m} 画像内の正規化座標
   eyeR: 10, mouthR: 12,
   lidColorL: '#e8e4de', lidColorR: '#e8e4de',
@@ -605,6 +606,20 @@ async function activateImage(record, { save = true } = {}) {
       if (sprite) flatAvatar.mouthFrameSprites.push({ t: f.t, sprite });
     }
     flatAvatar.mouthFrameSprites.sort((a, b) => a.t - b.t);
+  }
+  // 目専用フレーム群：口の開度ブレンドとは完全に別軸（実際のまばたき量）で、
+  // 常に「1枚の写真の目」だけをくっきり差し替える。口のクロスフェードと目を
+  // 重ねると2枚の目が透けて二重に見えるため、目の範囲は必ずこちらで上書きする。
+  flatAvatar.eyeFrameSprites = [];
+  if (flatAvatar.eyesClosedSprite && flatAvatar.mouthFrameSprites.length === 4) {
+    const [f25, f50, f75, f100] = flatAvatar.mouthFrameSprites;
+    flatAvatar.eyeFrameSprites = [
+      { t: 0,    sprite: flatAvatar.eyesClosedSprite },
+      { t: 0.25, sprite: f25.sprite },
+      { t: 0.5,  sprite: f50.sprite },
+      { t: 0.75, sprite: f75.sprite },
+      { t: 1.0,  sprite: f100.sprite },
+    ];
   }
   refreshLayerButtons();
 
@@ -1015,6 +1030,47 @@ function drawMaskedLayer(ctx, layer, ox, oy, w, h, regions, alpha) {
   ctx.globalAlpha = 1;
 }
 
+// 目専用フレーム群を、まばたき量（口とは無関係の独立軸）で1枚にくっきり差し替える。
+// 口のクロスフェードと同じ場所で2枚の目を重ねると透けて二重に見えるため、
+// 目の範囲は常にこの不透明な合成で完全に上書きする（ベース側の目は見えなくなる）。
+function drawMaskedFrameBlend(ctx, frames, v, ox, oy, w, h, regions) {
+  ensureOffscreen(w, h);
+  _maskCx.setTransform(1, 0, 0, 1, 0, 0);
+  _maskCx.clearRect(0, 0, w, h);
+  for (const rg of regions) {
+    const R = Math.max(rg.rx, rg.ry);
+    _maskCx.save();
+    _maskCx.translate(rg.x, rg.y);
+    _maskCx.scale(rg.rx / R, rg.ry / R);
+    const g = _maskCx.createRadialGradient(0, 0, 0, 0, 0, R);
+    g.addColorStop(0, 'rgba(0,0,0,1)');
+    g.addColorStop(0.62, 'rgba(0,0,0,1)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    _maskCx.fillStyle = g;
+    _maskCx.beginPath(); _maskCx.arc(0, 0, R, 0, Math.PI * 2); _maskCx.fill();
+    _maskCx.restore();
+  }
+  let lo = frames[0], hi = frames[frames.length - 1];
+  for (let i = 0; i < frames.length - 1; i++) {
+    if (v >= frames[i].t && v <= frames[i + 1].t) { lo = frames[i]; hi = frames[i + 1]; break; }
+  }
+  const span = Math.max(hi.t - lo.t, 0.0001);
+  const frac = clamp((v - lo.t) / span, 0, 1);
+  _layerCx.setTransform(1, 0, 0, 1, 0, 0);
+  _layerCx.clearRect(0, 0, w, h);
+  _layerCx.globalCompositeOperation = 'source-over';
+  _layerCx.drawImage(lo.sprite, 0, 0, w, h);
+  if (frac > 0.001) {
+    _layerCx.globalAlpha = frac;
+    _layerCx.drawImage(hi.sprite, 0, 0, w, h);
+    _layerCx.globalAlpha = 1;
+  }
+  _layerCx.globalCompositeOperation = 'destination-in';
+  _layerCx.drawImage(_maskCv, 0, 0);
+  _layerCx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(_layerCv, ox, oy, w, h); // alpha=1で完全上書き（ベースの目を透けさせない）
+}
+
 // 画像アバターの描画
 function renderFlat() {
   const cv = flatCanvas;
@@ -1066,19 +1122,26 @@ function renderFlat() {
       drawJawDrop(ctx, s, ox, oy, s.width, s.height, px.m, d, flatState.mouth);
     }
 
-    // 目：差分画像があれば目の周りだけクロスフェード、無ければまぶたを描き足し（どちらも開閉量に比例）
-    if (hasEyesLayer) {
+    // 目：実写の目フレーム群があれば「まばたき量」だけで1枚にくっきり差し替え（口とは無関係）。
+    // 1枚の目とじ差分だけならその周りだけクロスフェード、無ければまぶたを描き足し。
+    const hasEyeFrames = flatAvatar.eyeFrameSprites.length > 0;
+    if (hasEyeFrames) {
+      // 口の開き具合と無関係に、実際のまばたき量（flatState.blinkL/R）だけで
+      // 0〜100%の目フレームから1枚を選ぶ。ベースの口ブレンドの目を完全に上書きするので
+      // 2枚の目が透けて二重に見える問題が起きない。
+      const eyeOpen = 1 - clamp(Math.max(flatState.blinkL, flatState.blinkR), 0, 1);
+      drawMaskedFrameBlend(ctx, flatAvatar.eyeFrameSprites, eyeOpen, ox, oy, s.width, s.height, [
+        { x: px.le.x, y: px.le.y, rx: d * 0.5, ry: d * 0.5 },
+        { x: px.re.x, y: px.re.y, rx: d * 0.5, ry: d * 0.5 },
+      ]);
+    } else if (hasEyesLayer) {
       // 本物の目とじ写真を「目玉のところだけ」ギュッと絞って合成。位置が正確なので
       // 範囲を狭くできる＝顔の広い面が変わらず、目だけが閉じて見える。
       const raw = Math.max(flatState.blinkL, flatState.blinkR);
       const a = clamp((raw - 0.42) / 0.16, 0, 1);
-      // 実写連動セット（mouthFrames）は口が開くほど目も大きく開く写真なので、
-      // 目とじマスクを広めに取って開いた瞳がフチから透けないようにする
-      const eyeMaskRx = hasMouthFrames ? d * 0.62 : d * 0.34;
-      const eyeMaskRy = hasMouthFrames ? d * 0.62 : d * 0.24;
       drawMaskedLayer(ctx, flatAvatar.eyesClosedSprite, ox, oy, s.width, s.height, [
-        { x: px.le.x, y: px.le.y, rx: eyeMaskRx, ry: eyeMaskRy },
-        { x: px.re.x, y: px.re.y, rx: eyeMaskRx, ry: eyeMaskRy },
+        { x: px.le.x, y: px.le.y, rx: d * 0.34, ry: d * 0.24 },
+        { x: px.re.x, y: px.re.y, rx: d * 0.34, ry: d * 0.24 },
       ], a);
     } else {
       // 差分画像なし：眼の上の毛を引き下げて閉じる（実際の毛で・追加素材不要）
