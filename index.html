@@ -121,6 +121,9 @@
   <div class="row">
     <button id="btnLive2D" class="sub">Live2Dサンプル（動作確認）</button>
   </div>
+  <div class="row">
+    <button id="btnMesh" class="sub">ネコ（メッシュ変形・試作）</button>
+  </div>
   <input type="file" id="fileInput" accept=".vrm,image/png,image/jpeg,image/webp" hidden>
   <input type="file" id="layerInput" accept="image/png,image/jpeg,image/webp" hidden>
 
@@ -268,7 +271,10 @@ function setMode(m) {
   document.body.dataset.mode = m;
   renderer.domElement.style.display = m === 'vrm' ? '' : 'none';
   $('flat').style.display = m === 'image' ? 'block' : 'none';
-  if (l2dApp) l2dApp.view.style.display = m === 'live2d' ? 'block' : 'none';
+  // Pixiキャンバスはlive2dとmesh（メッシュ変形試作）で共用
+  if (l2dApp) l2dApp.view.style.display = (m === 'live2d' || m === 'mesh') ? 'block' : 'none';
+  if (currentLive2D) currentLive2D.visible = (m === 'live2d');
+  if (meshContainer) meshContainer.visible = (m === 'mesh');
   // スマホで初めてアバターが出たら、自動でパネルを畳んで全身見えるように
   if (m !== 'none' && !autoCollapsedOnce && innerWidth <= 480 && settings.panelCollapsed === undefined) {
     autoCollapsedOnce = true;
@@ -502,6 +508,112 @@ function updateLive2D(delta) {
 }
 
 const SAMPLE_LIVE2D_URL = 'https://cdn.jsdelivr.net/gh/guansss/pixi-live2d-display@master/test/assets/haru/haru_greeter_t03.model3.json';
+
+// ---------- メッシュ変形（試作）：ネコ写真1枚を格子メッシュで連続変形 ----------
+// 写真の質感を残したまま、首の傾き・向き・呼吸・口/まばたきを「変形」で動かす。
+// Live2Dと違いGUIリグ不要・コードだけ。真の立体的な首振りは出せん（平面の擬似3D）。
+let meshContainer = null;  // plane を入れる入れ物（傾き・位置・拡縮はこっちに掛ける）
+let meshPlane = null;      // PIXI.SimplePlane（格子メッシュ）
+let meshRest = null;       // 変形前の頂点座標（基準）
+let meshCalib = null;      // {le,re,m} 正規化座標
+let meshBaseScale = 1;     // 画面フィット用の基準スケール
+const MESH_COLS = 28, MESH_ROWS = 28;
+const meshState  = { yaw: 0, pitch: 0, roll: 0, sx: 0, sy: 0, mouth: 0, blinkL: 0, blinkR: 0 };
+const meshTarget = { yaw: 0, pitch: 0, roll: 0, sx: 0, sy: 0, mouth: 0, blinkL: 0, blinkR: 0 };
+
+async function loadMeshFromImage(dataUrl, calib) {
+  setStatus('メッシュ試作を準備中…');
+  ensureL2DApp();
+  const tex = await PIXI.Texture.fromURL(dataUrl);
+  if (meshContainer) { l2dApp.stage.removeChild(meshContainer); meshContainer.destroy({ children: true }); }
+  meshContainer = new PIXI.Container();
+  meshPlane = new PIXI.SimplePlane(tex, MESH_COLS, MESH_ROWS);
+  meshRest = Float32Array.from(meshPlane.geometry.getBuffer('aVertexPosition').data);
+  meshContainer.addChild(meshPlane);
+  meshContainer.pivot.set(tex.width / 2, tex.height / 2);
+  l2dApp.stage.addChild(meshContainer);
+  meshCalib = calib || { le: { x: 0.47, y: 0.23 }, re: { x: 0.56, y: 0.23 }, m: { x: 0.51, y: 0.35 } };
+  layoutMesh();
+  setMode('mesh');
+  setStatus('メッシュ試作：顔に合わせて動くで（写真のまま変形）');
+}
+
+function layoutMesh() {
+  if (!meshPlane || !meshContainer) return;
+  const W = innerWidth, H = innerHeight;
+  const tw = meshPlane.texture.width, th = meshPlane.texture.height;
+  meshBaseScale = Math.min(W / tw, H / th) * 1.25; // 顔を大きめに（バストアップ寄り）
+  meshContainer.position.set(W / 2, H * 0.46);
+}
+
+// 頂点を変形（口の開け・まばたき・擬似3Dの向き）。傾き/位置/呼吸はcontainer側で。
+function deformMesh() {
+  if (!meshPlane || !meshRest) return;
+  const buf = meshPlane.geometry.getBuffer('aVertexPosition');
+  const d = buf.data, rest = meshRest;
+  const tw = meshPlane.texture.width, th = meshPlane.texture.height;
+  const mx = meshCalib.m.x * tw, my = meshCalib.m.y;
+  const leX = meshCalib.le.x * tw, leY = meshCalib.le.y * th;
+  const reX = meshCalib.re.x * tw, reY = meshCalib.re.y * th;
+  const eyeDist = Math.hypot(reX - leX, reY - leY) || tw * 0.1;
+  const s = meshState;
+  for (let i = 0; i < rest.length; i += 2) {
+    let x = rest[i], y = rest[i + 1];
+    const u = x / tw, v = y / th;
+    // 擬似3D：左右の向き＝中心からの距離で水平に圧縮＋少し平行移動
+    x += s.yaw * tw * 0.13 * (u - 0.5) + s.yaw * tw * 0.04;
+    // 上下の向き＝目の高さ基準で垂直に圧縮
+    y += s.pitch * th * 0.11 * (v - leY / th);
+    // 口：口ラインより下を、口の横位置中心に下へ引く（あご下げ）
+    if (v > my) {
+      const hx = Math.exp(-Math.pow((x - mx) / (tw * 0.20), 2));
+      const depth = clamp((v - my) / 0.26, 0, 1);
+      const fade = 1 - clamp((v - my) / 0.5, 0, 1);
+      y += s.mouth * th * 0.11 * hx * depth * fade;
+    }
+    // まばたき：目の周りの頂点を下げてまぶたを下ろす
+    const eyes = [[leX, leY, s.blinkL], [reX, reY, s.blinkR]];
+    for (let e = 0; e < 2; e++) {
+      const ex = eyes[e][0], ey = eyes[e][1], amt = eyes[e][2];
+      const dd = Math.hypot(x - ex, y - ey), r = eyeDist * 0.55;
+      if (dd < r) {
+        const w = 1 - dd / r;
+        const above = y <= ey + r * 0.25 ? 1 : 0.25; // 主に目より上の毛を下ろす
+        y += amt * eyeDist * 0.22 * w * above;
+      }
+    }
+    d[i] = x; d[i + 1] = y;
+  }
+  buf.update();
+}
+
+function updateMesh(delta) {
+  if (!meshContainer || !l2dApp) return;
+  for (const k in meshState) meshState[k] = lerp(meshState[k], meshTarget[k], 0.3);
+  meshFreezeApply();
+  deformMesh();
+  const breath = 1 + 0.012 * Math.sin(clock.elapsedTime * 2 * Math.PI / 4.2);
+  meshContainer.rotation = meshState.roll;
+  meshContainer.scale.set(meshBaseScale * (1 + 0.01 * Math.sin(clock.elapsedTime)), meshBaseScale * breath);
+  meshContainer.position.set(innerWidth / 2 + meshState.sx * innerWidth * 0.05,
+                             innerHeight * 0.46 + meshState.sy * innerHeight * 0.04);
+  l2dApp.render();
+}
+
+function applyFaceMesh(rig, mirrored, mir, fx) {
+  meshTarget.roll  = clamp(rig.head.z, -0.6, 0.6) * -0.9 * mir;
+  meshTarget.yaw   = clamp(rig.head.y, -0.6, 0.6) * mir;
+  meshTarget.pitch = clamp(rig.head.x, -0.6, 0.6) * -1 * fx;
+  meshTarget.sx    = clamp(rig.head.y, -0.6, 0.6) * mir;
+  meshTarget.sy    = clamp(rig.head.x, -0.6, 0.6) * -1 * fx;
+  const b = solveBlink(rig, mirrored);
+  meshTarget.blinkL = b.aL;
+  meshTarget.blinkR = b.aR;
+  meshTarget.mouth = clamp(Math.max(rig.mouth.shape.A, (rig.mouth.y ?? 0) * 0.8), 0, 1);
+}
+
+let __meshFreeze = null; // テスト用（カメラ無し環境でポーズ固定）
+function meshFreezeApply() { if (__meshFreeze) for (const k in __meshFreeze) if (k in meshState) meshState[k] = __meshFreeze[k]; }
 
 // ---------- 画像アバター（PNGtuber方式） ----------
 const flatCanvas = $('flat');
@@ -1432,6 +1544,18 @@ $('btnLive2D').addEventListener('click', async () => {
   }
 });
 
+$('btnMesh').addEventListener('click', async () => {
+  try {
+    const cat = window.CAT_AVATAR;
+    if (!cat) throw new Error('ネコ素材が読み込めてへん');
+    await loadMeshFromImage(cat.dataUrl, cat.calib);
+  } catch (err) {
+    console.error(err);
+    setStatus('メッシュ試作の準備に失敗… ' + (err.message || ''), 'err');
+  }
+});
+addEventListener('resize', layoutMesh);
+
 const dropOverlay = $('dropOverlay');
 addEventListener('dragover', (e) => { e.preventDefault(); dropOverlay.classList.add('on'); });
 addEventListener('dragleave', (e) => { if (!e.relatedTarget) dropOverlay.classList.remove('on'); });
@@ -1531,6 +1655,7 @@ function applyFace(rig) {
 
   if (mode === 'image') { applyFaceImage(rig, mirrored, mir, fx); return; }
   if (mode === 'live2d') { applyFaceLive2D(rig, mirrored, mir, fx); return; }
+  if (mode === 'mesh') { applyFaceMesh(rig, mirrored, mir, fx); return; }
   if (!currentVrm) return;
 
   // 頭・首・背骨（上ほど大きく追従）
@@ -1583,6 +1708,10 @@ function relaxToNeutral() {
     for (const k in l2dTarget) l2dTarget[k] = lerp(l2dTarget[k], rest[k], 0.08);
     return;
   }
+  if (mode === 'mesh') {
+    for (const k in meshTarget) meshTarget[k] = lerp(meshTarget[k], 0, 0.08);
+    return;
+  }
   rigRot('head', ZERO_ROT, 1, 0.06);
   rigRot('neck', ZERO_ROT, 1, 0.06);
   rigRot('spine', ZERO_ROT, 1, 0.06);
@@ -1630,6 +1759,8 @@ function tick() {
     renderFlat();
   } else if (mode === 'live2d') {
     updateLive2D(delta);
+  } else if (mode === 'mesh') {
+    updateMesh(delta);
   } else {
     controls.update();
     renderer.render(scene, camera3);
@@ -1654,7 +1785,9 @@ window.__vt = { applyFace, activateImage, getMode: () => mode,
   l2dPose: (p = {}) => { for (const k in p) if (k in l2dTarget) l2dTarget[k] = p[k]; },
   l2dParams: () => { if (!currentLive2D) return null; const ids = currentLive2D.internalModel.coreModel._parameterIds; return ids; },
   l2dModel: () => currentLive2D,
-  l2dFreeze: (p) => { __l2dFreeze = p; } };
+  l2dFreeze: (p) => { __l2dFreeze = p; },
+  loadMesh: () => loadMeshFromImage(window.CAT_AVATAR.dataUrl, window.CAT_AVATAR.calib),
+  meshFreeze: (p) => { __meshFreeze = p; } };
 
 // ---------- パネル表示切替 ----------
 function applyPip() {
