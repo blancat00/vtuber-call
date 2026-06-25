@@ -118,6 +118,9 @@
   <div class="row">
     <button id="btnSample" class="sub">3Dサンプル（VRM）</button>
   </div>
+  <div class="row">
+    <button id="btnLive2D" class="sub">Live2Dサンプル（動作確認）</button>
+  </div>
   <input type="file" id="fileInput" accept=".vrm,image/png,image/jpeg,image/webp" hidden>
   <input type="file" id="layerInput" accept="image/png,image/jpeg,image/webp" hidden>
 
@@ -193,6 +196,10 @@
 
 <!-- Kalidokit (UMD) -->
 <script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.5/dist/kalidokit.umd.js"></script>
+<!-- Live2D（Cubism Core → Pixi → pixi-live2d-display の順で読む） -->
+<script src="vendor/live2dcubismcore.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
 <!-- 付属ネコアバター素材 -->
 <script src="cat_assets.js"></script>
 
@@ -261,6 +268,7 @@ function setMode(m) {
   document.body.dataset.mode = m;
   renderer.domElement.style.display = m === 'vrm' ? '' : 'none';
   $('flat').style.display = m === 'image' ? 'block' : 'none';
+  if (l2dApp) l2dApp.view.style.display = m === 'live2d' ? 'block' : 'none';
   // スマホで初めてアバターが出たら、自動でパネルを畳んで全身見えるように
   if (m !== 'none' && !autoCollapsedOnce && innerWidth <= 480 && settings.panelCollapsed === undefined) {
     autoCollapsedOnce = true;
@@ -386,6 +394,114 @@ function frameBust(vrm) {
   controls.target.set(0, y, 0);
   controls.update();
 }
+
+// ---------- Live2D（pixi-live2d-display / Cubism4） ----------
+let l2dApp = null;        // PIXI.Application（遅延生成）
+let currentLive2D = null; // 読み込み中のモデル
+// トラッキング値の平滑化用（state=現在値、target=目標値）
+const l2dState  = { angleX: 0, angleY: 0, angleZ: 0, eyeL: 1, eyeR: 1, eyeX: 0, eyeY: 0, mouth: 0, mouthForm: 0 };
+const l2dTarget = { angleX: 0, angleY: 0, angleZ: 0, eyeL: 1, eyeR: 1, eyeX: 0, eyeY: 0, mouth: 0, mouthForm: 0 };
+
+function ensureL2DApp() {
+  if (l2dApp) return l2dApp;
+  if (!window.PIXI || !PIXI.live2d || !PIXI.live2d.Live2DModel) {
+    throw new Error('Live2Dライブラリが読み込めてへん（スクリプトの順番orネット確認）');
+  }
+  l2dApp = new PIXI.Application({
+    resizeTo: window,
+    backgroundAlpha: 0,
+    antialias: true,
+    autoStart: false,                 // 描画は自前のtick()から回す（裏画面でも描けるように）
+    resolution: Math.min(devicePixelRatio, 2),
+    autoDensity: true,
+  });
+  l2dApp.view.className = 'stage';
+  l2dApp.view.style.display = 'none';
+  document.body.prepend(l2dApp.view);
+  addEventListener('resize', layoutLive2D);
+  return l2dApp;
+}
+
+async function loadLive2DFromURL(url) {
+  setStatus('Live2D読み込み中…');
+  ensureL2DApp();
+  const model = await PIXI.live2d.Live2DModel.from(url, { autoInteract: false });
+  model.autoUpdate = false;           // 自前のtick()でupdateするので自動更新は切る
+  // 内蔵モーション（アイドル等）を止める：こちらが毎フレーム入れる追従値を上書きさせないため
+  try { model.internalModel.motionManager.stopAllMotions(); } catch {}
+  try { model.internalModel.motionManager.update = () => false; } catch {}
+  try { model.internalModel.eyeBlink = undefined; } catch {}  // 自動まばたきも切る（目は自分で制御）
+  // モーション適用後・最終反映前に追従値を書き込む（Cubismの初期化で消えないように）
+  model.internalModel.on('afterMotionUpdate', writeLive2DParams);
+
+  if (currentLive2D) { l2dApp.stage.removeChild(currentLive2D); currentLive2D.destroy(); }
+  currentLive2D = model;
+  model.anchor.set(0.5, 0.5);
+  l2dApp.stage.addChild(model);
+  layoutLive2D();
+  setMode('live2d');
+  setStatus('Live2D読み込み完了！顔に合わせて動くで');
+}
+
+// モデルを画面に収める（とりあえず全身が見える「contain」配置。バストアップは後で詰める）
+function layoutLive2D() {
+  if (!currentLive2D || !l2dApp) return;
+  const W = innerWidth, H = innerHeight;
+  const m = currentLive2D;
+  m.scale.set(1);
+  const s = Math.min(W / m.width, H / m.height) * 0.95;
+  m.scale.set(s);
+  m.position.set(W / 2, H / 2);
+}
+
+// 顔トラッキング結果（Kalidokitのrig）→ Live2Dパラメータの目標値に変換
+function applyFaceLive2D(rig, mirrored, mir, fx) {
+  // 顔の向き（画像アバターと同じ符号規約に合わせる）
+  l2dTarget.angleX = clamp(rig.head.y * mir, -0.6, 0.6) * 50;        // 左右
+  l2dTarget.angleY = clamp(rig.head.x * -1 * fx, -0.6, 0.6) * 50;   // 上下
+  l2dTarget.angleZ = clamp(rig.head.z * -1 * mir, -0.6, 0.6) * 50;  // 傾き
+  // まばたき（solveBlinkは閉じ量。Live2DのOpenは1=開なので反転）
+  const b = solveBlink(rig, mirrored);
+  l2dTarget.eyeL = clamp(1 - b.aL, 0, 1);
+  l2dTarget.eyeR = clamp(1 - b.aR, 0, 1);
+  // 口
+  const sh = rig.mouth.shape;
+  l2dTarget.mouth = clamp(Math.max(sh.A, (rig.mouth.y ?? 0) * 0.8), 0, 1);
+  l2dTarget.mouthForm = clamp((sh.I + sh.E) - (sh.U + sh.O), -1, 1);
+  // 目線
+  l2dTarget.eyeX = clamp(rig.pupil.x * mir, -1, 1);
+  l2dTarget.eyeY = clamp(rig.pupil.y, -1, 1);
+}
+
+// パラメータの書き込み。afterMotionUpdate（モーション適用後・最終反映前）から呼ぶことで、
+// Cubismがupdate冒頭でパラメータを初期化しても上書きされず、こちらの追従値が生き残る。
+function writeLive2DParams() {
+  if (!currentLive2D) return;
+  const c = currentLive2D.internalModel.coreModel;
+  const set = (id, v) => { try { c.setParameterValueById(id, v); } catch {} };
+  set('ParamAngleX', l2dState.angleX);
+  set('ParamAngleY', l2dState.angleY);
+  set('ParamAngleZ', l2dState.angleZ);
+  set('ParamBodyAngleX', l2dState.angleX * 0.3);
+  set('ParamEyeLOpen', l2dState.eyeL);
+  set('ParamEyeROpen', l2dState.eyeR);
+  set('ParamEyeBallX', l2dState.eyeX);
+  set('ParamEyeBallY', l2dState.eyeY);
+  set('ParamMouthOpenY', l2dState.mouth);
+  set('ParamMouthForm', l2dState.mouthForm);
+}
+
+// 毎フレーム：平滑化 → update（この中でafterMotionUpdate→writeLive2DParamsが走る）→ 描画
+let __l2dFreeze = null; // テスト用：指定キーを固定（カメラ無し環境で追従を確認するため）
+function updateLive2D(delta) {
+  if (!currentLive2D || !l2dApp) return;
+  for (const k in l2dState) l2dState[k] = lerp(l2dState[k], l2dTarget[k], 0.35);
+  if (__l2dFreeze) for (const k in __l2dFreeze) if (k in l2dState) l2dState[k] = __l2dFreeze[k];
+  currentLive2D.update(delta * 1000);
+  l2dApp.render();
+}
+
+const SAMPLE_LIVE2D_URL = 'https://cdn.jsdelivr.net/gh/guansss/pixi-live2d-display@master/test/assets/haru/haru_greeter_t03.model3.json';
 
 // ---------- 画像アバター（PNGtuber方式） ----------
 const flatCanvas = $('flat');
@@ -1307,6 +1423,15 @@ $('btnSample').addEventListener('click', async () => {
   }
 });
 
+$('btnLive2D').addEventListener('click', async () => {
+  try {
+    await loadLive2DFromURL(SAMPLE_LIVE2D_URL);
+  } catch (err) {
+    console.error(err);
+    setStatus('Live2Dサンプルの取得に失敗… ' + (err.message || ''), 'err');
+  }
+});
+
 const dropOverlay = $('dropOverlay');
 addEventListener('dragover', (e) => { e.preventDefault(); dropOverlay.classList.add('on'); });
 addEventListener('dragleave', (e) => { if (!e.relatedTarget) dropOverlay.classList.remove('on'); });
@@ -1405,6 +1530,7 @@ function applyFace(rig) {
   const fx  = $('chkFlipX').checked ? -1 : 1;
 
   if (mode === 'image') { applyFaceImage(rig, mirrored, mir, fx); return; }
+  if (mode === 'live2d') { applyFaceLive2D(rig, mirrored, mir, fx); return; }
   if (!currentVrm) return;
 
   // 頭・首・背骨（上ほど大きく追従）
@@ -1449,6 +1575,12 @@ function applyFaceImage(rig, mirrored, mir, fx) {
 function relaxToNeutral() {
   if (mode === 'image') {
     for (const k in flatTarget) flatTarget[k] = lerp(flatTarget[k], 0, 0.08);
+    return;
+  }
+  if (mode === 'live2d') {
+    // 顔が見えへんときは正面・目開き・口閉じへ戻す
+    const rest = { angleX: 0, angleY: 0, angleZ: 0, eyeL: 1, eyeR: 1, eyeX: 0, eyeY: 0, mouth: 0, mouthForm: 0 };
+    for (const k in l2dTarget) l2dTarget[k] = lerp(l2dTarget[k], rest[k], 0.08);
     return;
   }
   rigRot('head', ZERO_ROT, 1, 0.06);
@@ -1496,6 +1628,8 @@ function tick() {
     renderer.render(scene, camera3);
   } else if (mode === 'image') {
     renderFlat();
+  } else if (mode === 'live2d') {
+    updateLive2D(delta);
   } else {
     controls.update();
     renderer.render(scene, camera3);
@@ -1514,7 +1648,13 @@ setInterval(() => { if (document.hidden) tick(); }, 33);
 let __freezeMouth = null, __freezeBlink = null; // テスト用：口・目の開きを固定
 window.__vt = { applyFace, activateImage, getMode: () => mode,
   freezeMouth: (v) => { __freezeMouth = v; },
-  freezeBlink: (v) => { __freezeBlink = v; } };
+  freezeBlink: (v) => { __freezeBlink = v; },
+  loadLive2D: (url) => loadLive2DFromURL(url || SAMPLE_LIVE2D_URL),
+  // カメラ無しでも追従を検証するための手動ポーズ（部分指定OK）
+  l2dPose: (p = {}) => { for (const k in p) if (k in l2dTarget) l2dTarget[k] = p[k]; },
+  l2dParams: () => { if (!currentLive2D) return null; const ids = currentLive2D.internalModel.coreModel._parameterIds; return ids; },
+  l2dModel: () => currentLive2D,
+  l2dFreeze: (p) => { __l2dFreeze = p; } };
 
 // ---------- パネル表示切替 ----------
 function applyPip() {
